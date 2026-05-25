@@ -133,10 +133,10 @@ class DiffModal(ModalScreen):
                 raw = fetch_pr_diff(self._repo_slug, self._pr_num)
             except Exception as exc:  # noqa: BLE001
                 if not worker.is_cancelled:
-                    self.call_from_thread(self._on_error, str(exc))
+                    self.app.call_from_thread(self._on_error, str(exc))
                 return
             if not worker.is_cancelled:
-                self.call_from_thread(self._on_ready, raw)
+                self.app.call_from_thread(self._on_ready, raw)
         return task
 
     def _on_ready(self, raw: str) -> None:
