@@ -1,0 +1,21 @@
+[workspace]
+channels = ["conda-forge"]
+name = "ghstack-tui"
+platforms = ["osx-arm64", "linux-64"]
+version = "0.1.0"
+
+[tasks]
+tui = "python -m ghstack_tui"
+
+[dependencies]
+python = ">=3.11,<3.13"
+pip = "*"
+
+[pypi-dependencies]
+textual = ">=0.79"
+ghstack_tui = { path = ".", editable = true }
+pytest = ">=8"
+pytest-asyncio = ">=0.23"
+
+[tasks.test]
+cmd = "pytest tests/ -v"
