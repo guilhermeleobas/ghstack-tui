@@ -4,6 +4,44 @@ from __future__ import annotations
 
 from rich.text import Text
 
+_FAIL_CONCLUSIONS = {
+    "FAILURE", "ERROR", "TIMED_OUT", "CANCELLED",
+    "ACTION_REQUIRED", "STARTUP_FAILURE",
+}
+
+
+def get_failing_jobs(data: dict) -> list[str]:
+    """Return names of failing CI jobs (empty list if none)."""
+    rollup = data.get("statusCheckRollup") or []
+    failing: list[str] = []
+    for c in rollup:
+        status = (c.get("status") or "").upper()
+        conclusion = (c.get("conclusion") or "").upper()
+        if status != "COMPLETED" or conclusion not in _FAIL_CONCLUSIONS:
+            continue
+        if c.get("__typename") == "CheckRun":
+            name = c.get("name") or "?"
+            wf = c.get("workflowName")
+            label = f"{wf} / {name}" if wf and wf != name else name
+        else:
+            label = c.get("context") or c.get("name") or "?"
+        failing.append(label)
+    return failing
+
+
+def render_ci_failures(data: dict) -> "Text | None":
+    """Rich Text listing failing job names, or None if no failures."""
+    failing = get_failing_jobs(data)
+    if not failing:
+        return None
+    t = Text()
+    for job in failing:
+        t.append("✗ ", style="bold red")
+        t.append(job)
+        t.append("\n")
+    t.rstrip()
+    return t
+
 
 def render_header(data: dict) -> Text:
     """Top line of the detail panel: PR number, title, state, draft, author, mergeable."""

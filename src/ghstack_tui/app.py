@@ -1,3 +1,5 @@
+import shlex
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,9 +14,11 @@ from textual.widgets import DataTable, Footer, Header, Input, Label, Markdown, S
 from textual.worker import Worker, get_current_worker
 
 from ghstack_tui import detail as detail_render
+from ghstack_tui.detail import get_failing_jobs
 from ghstack_tui.gh_client import (
     DEFAULT_QUERY,
     fetch_pr_details,
+    fetch_pr_diff,
     fetch_pr_full,
     load_stacks,
 )
@@ -72,6 +76,151 @@ class CheckoutModal(ModalScreen):
         self.dismiss(None)
 
 
+class DiffModal(ModalScreen):
+    """Full-screen diff overlay. Fetches `gh pr diff` in background, renders colored."""
+
+    DEFAULT_CSS = """
+    DiffModal { align: center middle; }
+    #_dm_box {
+        width: 98%;
+        height: 95%;
+        border: thick $accent;
+        background: $surface;
+    }
+    #_dm_header {
+        height: 2;
+        padding: 0 1;
+        background: $panel;
+    }
+    #_dm_title  { text-style: bold; }
+    #_dm_status { color: $text-muted; }
+    #_dm_scroll { height: 1fr; }
+    #_dm_text   { padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("q", "close", "Close"),
+        Binding("escape", "close", "Close"),
+        Binding("j", "scroll_down", "↓", show=False),
+        Binding("k", "scroll_up", "↑", show=False),
+    ]
+
+    def __init__(self, pr_num: int, repo_slug: str, subject: str = "") -> None:
+        super().__init__()
+        self._pr_num = pr_num
+        self._repo_slug = repo_slug
+        self._subject = subject
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="_dm_box"):
+            with Horizontal(id="_dm_header"):
+                yield Label(
+                    f"Diff  PR #{self._pr_num}  ({self._repo_slug})"
+                    + (f"  {self._subject[:60]}" if self._subject else ""),
+                    id="_dm_title",
+                )
+                yield Label("Loading…", id="_dm_status")
+            with VerticalScroll(id="_dm_scroll"):
+                yield Static("", id="_dm_text")
+
+    def on_mount(self) -> None:
+        self.run_worker(self._fetch(), thread=True, name="diff-fetch")
+
+    def _fetch(self):
+        def task() -> None:
+            worker = get_current_worker()
+            try:
+                raw = fetch_pr_diff(self._repo_slug, self._pr_num)
+            except Exception as exc:  # noqa: BLE001
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._on_error, str(exc))
+                return
+            if not worker.is_cancelled:
+                self.call_from_thread(self._on_ready, raw)
+        return task
+
+    def _on_ready(self, raw: str) -> None:
+        lines = raw.count("\n")
+        self.query_one("#_dm_status", Label).update(
+            Text(f"{lines} lines   q/esc close", style="dim")
+        )
+        self.query_one("#_dm_text", Static).update(_render_diff(raw))
+
+    def _on_error(self, msg: str) -> None:
+        self.query_one("#_dm_status", Label).update(
+            Text(f"Error: {msg}", style="red")
+        )
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#_dm_scroll", VerticalScroll).scroll_relative(y=3)
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#_dm_scroll", VerticalScroll).scroll_relative(y=-3)
+
+
+class _AskClaudeModal(ModalScreen):
+    """Floating dialog: show failing CI context, pick repo path, spawn claude."""
+
+    DEFAULT_CSS = """
+    _AskClaudeModal { align: center middle; }
+    #_cc_box {
+        width: 72;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #_cc_title   { text-style: bold; margin-bottom: 1; }
+    #_cc_failing { color: $error; margin-bottom: 1; }
+    #_cc_hint    { color: $text-muted; margin-top: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(
+        self,
+        pr_num: int | None,
+        repo_slug: str | None,
+        failing: list[str],
+    ) -> None:
+        super().__init__()
+        self._pr_num = pr_num
+        self._repo_slug = repo_slug or "?"
+        self._failing = failing
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="_cc_box"):
+            yield Label(
+                f"Ask Claude  PR #{self._pr_num}  ({self._repo_slug})",
+                id="_cc_title",
+            )
+            if self._failing:
+                shown = self._failing[:6]
+                extra = len(self._failing) - len(shown)
+                lines = "\n".join(f"  ✗ {j}" for j in shown)
+                if extra:
+                    lines += f"\n  … +{extra} more"
+                yield Label(lines, id="_cc_failing")
+            yield Input(
+                value=_DEFAULT_CHECKOUT_PATH,
+                placeholder="Path to repo",
+                id="_cc_input",
+            )
+            yield Label("↵ open Claude in repo   esc cancel", id="_cc_hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#_cc_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class GhstackTUI(App):
     """Three-pane viewer for ghstack stacks.
 
@@ -97,6 +246,8 @@ class GhstackTUI(App):
     #detail_meta { padding: 0 0 1 0; }
     #detail_body { background: $surface; max-height: 50%; overflow-y: auto; }
     .section_title { color: $accent; text-style: bold; padding: 1 0 0 0; }
+    #ci_fail_title { display: none; }
+    #detail_ci_failures { display: none; padding: 0 0 1 0; }
     """
 
     BINDINGS = [
@@ -108,6 +259,9 @@ class GhstackTUI(App):
         Binding("k", "cursor_up", "Up", show=False),
         Binding("r", "reload", "Reload"),
         Binding("c", "checkout", "Checkout"),
+        Binding("a", "ask_claude", "Ask Claude"),
+        Binding("d", "diff", "Diff"),
+        Binding("v", "view_in_editor", "View diff"),
         Binding("/", "focus_query", "Edit query"),
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
@@ -133,6 +287,8 @@ class GhstackTUI(App):
                 with VerticalScroll(id="detail"):
                     yield Static("", id="detail_header")
                     yield Static("", id="detail_meta")
+                    yield Static("Failing CI", classes="section_title", id="ci_fail_title")
+                    yield Static("", id="detail_ci_failures")
                     yield Static("Body", classes="section_title")
                     yield Markdown("", id="detail_body")
                     yield Static("Checks", classes="section_title")
@@ -258,6 +414,8 @@ class GhstackTUI(App):
         checks.update(Text("…", style="dim"))
         reviewers.update(Text("…", style="dim"))
         files.update(Text("…", style="dim"))
+        self.query_one("#ci_fail_title").display = False
+        self.query_one("#detail_ci_failures", Static).display = False
 
         if c.repo_slug is None or c.pr_num is None:
             meta.update(Text("(PR not in current query window)", style="dim"))
@@ -307,6 +465,17 @@ class GhstackTUI(App):
         checks.update(detail_render.render_checks(data))
         reviewers.update(detail_render.render_reviewers(data))
         files.update(detail_render.render_files(data))
+
+        ci_fail_title = self.query_one("#ci_fail_title")
+        ci_failures = self.query_one("#detail_ci_failures", Static)
+        failures_text = detail_render.render_ci_failures(data)
+        if failures_text is not None:
+            ci_failures.update(failures_text)
+            ci_fail_title.display = True
+            ci_failures.display = True
+        else:
+            ci_fail_title.display = False
+            ci_failures.display = False
 
     def _render_detail_error(self, msg: str) -> None:
         self.query_one("#detail_meta", Static).update(Text(f"Detail fetch failed: {msg}", style="red"))
@@ -363,6 +532,28 @@ class GhstackTUI(App):
         self._detail_cache.clear()
         self._load()
 
+    def action_ask_claude(self) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.pr_num is None:
+            self.notify("No PR selected", severity="warning")
+            return
+        failing: list[str] = []
+        if commit.repo_slug and commit.pr_num:
+            cached = self._detail_cache.get((commit.repo_slug, commit.pr_num))
+            if cached:
+                failing = get_failing_jobs(cached)
+        self.push_screen(
+            _AskClaudeModal(commit.pr_num, commit.repo_slug, failing),
+            self._on_claude_repo_path,
+        )
+
+    def _on_claude_repo_path(self, repo_path: str | None) -> None:
+        if not repo_path:
+            return
+        expanded = str(Path(repo_path).expanduser())
+        with self.suspend():
+            subprocess.run(["claude"], cwd=expanded)
+
     def action_checkout(self) -> None:
         commit = self._get_selected_commit()
         if commit is None or commit.pr_num is None:
@@ -418,6 +609,34 @@ class GhstackTUI(App):
                 )
 
         return task
+
+    def action_diff(self) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.pr_num is None or commit.repo_slug is None:
+            self.notify("No PR selected", severity="warning")
+            return
+        self.push_screen(
+            DiffModal(commit.pr_num, commit.repo_slug, commit.subject)
+        )
+
+    def action_view_in_editor(self) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.pr_num is None or commit.repo_slug is None:
+            self.notify("No PR selected", severity="warning")
+            return
+        diff_cmd = (
+            f"gh pr diff {commit.pr_num} --repo {shlex.quote(commit.repo_slug)}"
+        )
+        if shutil.which("delta"):
+            cmd = f"{diff_cmd} | delta"
+        elif shutil.which("nvim"):
+            cmd = f"{diff_cmd} | nvim -c 'set ft=diff' -"
+        elif shutil.which("vim"):
+            cmd = f"{diff_cmd} | vim -c 'set ft=diff' -"
+        else:
+            cmd = f"{diff_cmd} | less -R"
+        with self.suspend():
+            subprocess.run(["bash", "-c", cmd], check=False)
 
     def _get_selected_commit(self) -> "Commit | None":
         if not self.stacks:
@@ -524,3 +743,24 @@ def _rel_time(iso: str) -> str:
 
 def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _render_diff(raw: str) -> Text:
+    """Colorize a unified diff string into a Rich Text object."""
+    t = Text(no_wrap=True)
+    for line in raw.splitlines():
+        if line.startswith("diff ") or line.startswith("index "):
+            t.append(line + "\n", style="bold yellow")
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            t.append(line + "\n", style="bold")
+        elif line.startswith("+"):
+            t.append(line + "\n", style="green")
+        elif line.startswith("-"):
+            t.append(line + "\n", style="red")
+        elif line.startswith("@@"):
+            t.append(line + "\n", style="cyan")
+        elif line.startswith("\\"):
+            t.append(line + "\n", style="dim")
+        else:
+            t.append(line + "\n")
+    return t

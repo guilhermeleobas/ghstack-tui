@@ -128,6 +128,17 @@ def fetch_pr_full(repo_slug: str, pr_num: int) -> dict:
     return json.loads(proc.stdout)
 
 
+def fetch_pr_diff(repo_slug: str, pr_num: int) -> str:
+    """Return unified diff text for the given PR via `gh pr diff`."""
+    proc = subprocess.run(
+        ["gh", "pr", "diff", str(pr_num), "--repo", repo_slug],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout
+
+
 def _parse_stack_block(body: str) -> tuple[int, ...]:
     """Extract the ordered PR list from a ghstack 'Stack from' block.
 
