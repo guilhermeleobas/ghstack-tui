@@ -16,6 +16,7 @@ textual = ">=0.79"
 ghstack_tui = { path = ".", editable = true }
 pytest = ">=8"
 pytest-asyncio = ">=0.23"
+mcp = ">=1.0"
 
 [tasks.test]
 cmd = "pytest tests/ -v"

@@ -1,6 +1,8 @@
+import json
 import shlex
 import shutil
 import subprocess
+import sys
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -552,9 +554,39 @@ class GhstackTUI(App):
     def _on_claude_repo_path(self, repo_path: str | None) -> None:
         if not repo_path:
             return
+        commit = self._get_selected_commit()
         expanded = str(Path(repo_path).expanduser())
+        if commit is not None:
+            self._write_mcp_config(expanded, commit)
         with self.suspend():
             subprocess.run(["claude"], cwd=expanded)
+
+    def _write_mcp_config(self, repo_path: str, commit: Commit) -> None:
+        """Write / merge .mcp.json in repo_path so Claude Code loads our MCP server."""
+        stack = self.stacks[self._current_stack_idx] if self.stacks else None
+        stack_prs = [str(c.pr_num) for c in stack.commits if c.pr_num] if stack else []
+
+        server_script = str(Path(__file__).parent / "mcp_server.py")
+        config_entry = {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [
+                server_script,
+                "--repo", commit.repo_slug or "",
+                "--pr", str(commit.pr_num or 0),
+                "--stack", ",".join(stack_prs),
+            ],
+        }
+
+        mcp_json = Path(repo_path) / ".mcp.json"
+        existing: dict = {}
+        if mcp_json.exists():
+            try:
+                existing = json.loads(mcp_json.read_text())
+            except Exception:  # noqa: BLE001
+                pass
+        existing.setdefault("mcpServers", {})["ghstack-tui"] = config_entry
+        mcp_json.write_text(json.dumps(existing, indent=2))
 
     def action_checkout(self) -> None:
         commit = self._get_selected_commit()
