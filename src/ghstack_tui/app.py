@@ -178,7 +178,7 @@ class _AskClaudeModal(ModalScreen):
     }
     #_cc_title   { text-style: bold; margin-bottom: 1; }
     #_cc_failing { color: $error; margin-bottom: 1; }
-    #_cc_lbl     { color: $text-muted; margin-top: 1; }
+    .cc_lbl      { color: $text-muted; margin-top: 1; }
     #_cc_hint    { color: $text-muted; margin-top: 1; }
     """
 
@@ -210,13 +210,13 @@ class _AskClaudeModal(ModalScreen):
                 if extra:
                     lines += f"\n  … +{extra} more"
                 yield Label(lines, id="_cc_failing")
-            yield Label("Repo path:", id="_cc_lbl")
+            yield Label("Repo path:", classes="cc_lbl")
             yield Input(
                 value=_DEFAULT_CHECKOUT_PATH,
                 placeholder="Path to repo",
                 id="_cc_path",
             )
-            yield Label("Initial prompt (editable):", id="_cc_lbl")
+            yield Label("Initial prompt (editable):", classes="cc_lbl")
             yield Input(
                 value=self._default_prompt,
                 placeholder="What should Claude do?",
