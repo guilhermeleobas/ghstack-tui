@@ -120,16 +120,34 @@ def test_on_chat_error_adds_error_line():
     app._chat_lines = [("user", "q")]
     app._chat_streaming = "partial"
 
-    # Patch notify so it doesn't need a running app.
     app.notify = MagicMock()
-    app._on_chat_error("connection refused")
+    app._on_chat_error("some unexpected error")
 
     assert app._chat_streaming == ""
     last_role, last_text = app._chat_lines[-1]
     assert last_role == "assistant"
     assert "Error" in last_text
-    assert "connection refused" in last_text
     app.notify.assert_called_once()
+
+
+def test_on_chat_error_connection_refused_friendly():
+    app = _patched_app()
+    app._chat_lines = [("user", "q")]
+    app.notify = MagicMock()
+    app._on_chat_error("connection refused")
+
+    _, last_text = app._chat_lines[-1]
+    assert "pixi run serve" in last_text
+
+
+def test_on_chat_error_model_not_found_friendly():
+    app = _patched_app()
+    app._chat_lines = [("user", "q")]
+    app.notify = MagicMock()
+    app._on_chat_error("model 'phi4-mini' not found")
+
+    _, last_text = app._chat_lines[-1]
+    assert "pull-phi4" in last_text
 
 
 # ---------------------------------------------------------------------------

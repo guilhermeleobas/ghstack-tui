@@ -816,9 +816,16 @@ class GhstackTUI(App):
 
     def _on_chat_error(self, msg: str) -> None:
         self._chat_streaming = ""
-        self._chat_lines.append(("assistant", f"[Error: {msg}]"))
+        low = msg.lower()
+        if "connection refused" in low or "connect" in low:
+            friendly = "Cannot reach Ollama. Run: pixi run serve"
+        elif "model" in low and ("not found" in low or "pull" in low):
+            friendly = "Model not found. Run: pixi run pull-phi4"
+        else:
+            friendly = f"Error: {msg}"
+        self._chat_lines.append(("assistant", friendly))
         self._update_chat_display()
-        self.notify(f"Ollama error: {msg}", severity="error")
+        self.notify(friendly, severity="error")
 
     def _update_chat_display(self) -> None:
         log = self.query_one("#chat_log", Static)
