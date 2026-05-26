@@ -5,11 +5,11 @@ platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
 [tasks]
+tui = "python -m ghstack_tui"
 
 [dependencies]
 python = ">=3.11,<3.13"
 pip = "*"
-ollama = "*"
 
 [pypi-dependencies]
 textual = ">=0.79"
@@ -17,16 +17,6 @@ ghstack_tui = { path = ".", editable = true }
 pytest = ">=8"
 pytest-asyncio = ">=0.23"
 mcp = ">=1.0"
-ollama = ">=0.4"
 
 [tasks.test]
 cmd = "pytest tests/ -v"
-
-[tasks.serve]
-cmd = "ollama serve"
-
-[tasks.pull-phi4]
-cmd = "ollama pull phi4-mini"
-
-[tasks.tui]
-cmd = "python -m ghstack_tui"
