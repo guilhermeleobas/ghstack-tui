@@ -1,6 +1,7 @@
 import shlex
 import shutil
 import subprocess
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -262,6 +263,7 @@ class GhstackTUI(App):
         Binding("a", "ask_claude", "Ask Claude"),
         Binding("d", "diff", "Diff"),
         Binding("v", "view_in_editor", "View diff"),
+        Binding("o", "open_in_browser", "Open PR"),
         Binding("/", "focus_query", "Edit query"),
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
@@ -609,6 +611,14 @@ class GhstackTUI(App):
                 )
 
         return task
+
+    def action_open_in_browser(self) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.url is None:
+            self.notify("No PR URL available", severity="warning")
+            return
+        webbrowser.open(commit.url)
+        self.notify(f"Opened {commit.url}", title="Browser")
 
     def action_diff(self) -> None:
         commit = self._get_selected_commit()
