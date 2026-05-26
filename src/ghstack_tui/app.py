@@ -165,12 +165,12 @@ class DiffModal(ModalScreen):
 
 
 class _AskClaudeModal(ModalScreen):
-    """Floating dialog: show failing CI context, pick repo path, spawn claude."""
+    """Floating dialog: show failing CI context, pick repo path + initial prompt, spawn claude."""
 
     DEFAULT_CSS = """
     _AskClaudeModal { align: center middle; }
     #_cc_box {
-        width: 72;
+        width: 80;
         height: auto;
         border: thick $accent;
         background: $surface;
@@ -178,6 +178,7 @@ class _AskClaudeModal(ModalScreen):
     }
     #_cc_title   { text-style: bold; margin-bottom: 1; }
     #_cc_failing { color: $error; margin-bottom: 1; }
+    #_cc_lbl     { color: $text-muted; margin-top: 1; }
     #_cc_hint    { color: $text-muted; margin-top: 1; }
     """
 
@@ -188,11 +189,13 @@ class _AskClaudeModal(ModalScreen):
         pr_num: int | None,
         repo_slug: str | None,
         failing: list[str],
+        default_prompt: str = "",
     ) -> None:
         super().__init__()
         self._pr_num = pr_num
         self._repo_slug = repo_slug or "?"
         self._failing = failing
+        self._default_prompt = default_prompt
 
     def compose(self) -> ComposeResult:
         with Vertical(id="_cc_box"):
@@ -207,18 +210,30 @@ class _AskClaudeModal(ModalScreen):
                 if extra:
                     lines += f"\n  … +{extra} more"
                 yield Label(lines, id="_cc_failing")
+            yield Label("Repo path:", id="_cc_lbl")
             yield Input(
                 value=_DEFAULT_CHECKOUT_PATH,
                 placeholder="Path to repo",
-                id="_cc_input",
+                id="_cc_path",
             )
-            yield Label("↵ open Claude in repo   esc cancel", id="_cc_hint")
+            yield Label("Initial prompt (editable):", id="_cc_lbl")
+            yield Input(
+                value=self._default_prompt,
+                placeholder="What should Claude do?",
+                id="_cc_prompt",
+            )
+            yield Label("↵ on prompt launches Claude   tab switches fields   esc cancel", id="_cc_hint")
 
     def on_mount(self) -> None:
-        self.query_one("#_cc_input", Input).focus()
+        self.query_one("#_cc_prompt", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip() or None)
+        if event.input.id == "_cc_path":
+            self.query_one("#_cc_prompt", Input).focus()
+            return
+        path = self.query_one("#_cc_path", Input).value.strip()
+        prompt = self.query_one("#_cc_prompt", Input).value.strip()
+        self.dismiss((path or None, prompt or None))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -546,20 +561,41 @@ class GhstackTUI(App):
             cached = self._detail_cache.get((commit.repo_slug, commit.pr_num))
             if cached:
                 failing = get_failing_jobs(cached)
+        if failing:
+            shown = ", ".join(failing[:3])
+            suffix = f" (+{len(failing) - 3} more)" if len(failing) > 3 else ""
+            default_prompt = (
+                f"Fix the CI failures on PR #{commit.pr_num}. "
+                f"Failing jobs: {shown}{suffix}. "
+                f"Use get_failing_jobs to list all failures, "
+                f"get_pr_diff to understand the changes, then fix the issues."
+            )
+        else:
+            default_prompt = (
+                f"Review PR #{commit.pr_num}. "
+                f"Use get_pr_info and get_pr_diff to understand the changes."
+            )
         self.push_screen(
-            _AskClaudeModal(commit.pr_num, commit.repo_slug, failing),
-            self._on_claude_repo_path,
+            _AskClaudeModal(commit.pr_num, commit.repo_slug, failing, default_prompt),
+            self._on_claude_modal_result,
         )
 
-    def _on_claude_repo_path(self, repo_path: str | None) -> None:
+    def _on_claude_modal_result(
+        self, result: "tuple[str | None, str | None] | None"
+    ) -> None:
+        if not result:
+            return
+        repo_path, prompt = result
         if not repo_path:
+            self.notify("No repo path", severity="warning")
             return
         commit = self._get_selected_commit()
         expanded = str(Path(repo_path).expanduser())
         if commit is not None:
             self._write_mcp_config(expanded, commit)
+        cmd = ["claude", prompt] if prompt else ["claude"]
         with self.suspend():
-            subprocess.run(["claude"], cwd=expanded)
+            subprocess.run(cmd, cwd=expanded)
 
     def _write_mcp_config(self, repo_path: str, commit: Commit) -> None:
         """Write / merge .mcp.json in repo_path so Claude Code loads our MCP server."""
