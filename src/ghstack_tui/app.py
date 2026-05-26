@@ -258,6 +258,7 @@ class GhstackTUI(App):
     #main { height: 1fr; }
     #stacks  { width: 30%; border: solid $accent; }
     #right_col { width: 70%; }
+    #center_col { width: 1fr; }
     #commits { height: 3fr; border: solid $accent; }
     #detail  { height: 4fr; border: solid $accent; padding: 0 1; }
     DataTable { height: 1fr; }
@@ -268,7 +269,7 @@ class GhstackTUI(App):
     .section_title { color: $accent; text-style: bold; padding: 1 0 0 0; }
     #ci_fail_title { display: none; }
     #detail_ci_failures { display: none; padding: 0 0 1 0; }
-    #chat_col { height: 3fr; border: solid $accent; display: none; }
+    #chat_col { width: 40%; border: solid $accent; display: none; }
     #chat_scroll { height: 1fr; }
     #chat_log { padding: 0 1; }
     #chat_input { height: 3; border-top: solid $accent-darken-1; }
@@ -312,21 +313,22 @@ class GhstackTUI(App):
         yield Input(value=self.query_str, placeholder="GitHub PR search query", id="query")
         with Horizontal(id="main"):
             yield DataTable(id="stacks", cursor_type="row", zebra_stripes=True)
-            with Vertical(id="right_col"):
-                yield DataTable(id="commits", cursor_type="row", zebra_stripes=True)
-                with VerticalScroll(id="detail"):
-                    yield Static("", id="detail_header")
-                    yield Static("", id="detail_meta")
-                    yield Static("Failing CI", classes="section_title", id="ci_fail_title")
-                    yield Static("", id="detail_ci_failures")
-                    yield Static("Body", classes="section_title")
-                    yield Markdown("", id="detail_body")
-                    yield Static("Checks", classes="section_title")
-                    yield Static("", id="detail_checks")
-                    yield Static("Reviewers", classes="section_title")
-                    yield Static("", id="detail_reviewers")
-                    yield Static("Files", classes="section_title")
-                    yield Static("", id="detail_files")
+            with Horizontal(id="right_col"):
+                with Vertical(id="center_col"):
+                    yield DataTable(id="commits", cursor_type="row", zebra_stripes=True)
+                    with VerticalScroll(id="detail"):
+                        yield Static("", id="detail_header")
+                        yield Static("", id="detail_meta")
+                        yield Static("Failing CI", classes="section_title", id="ci_fail_title")
+                        yield Static("", id="detail_ci_failures")
+                        yield Static("Body", classes="section_title")
+                        yield Markdown("", id="detail_body")
+                        yield Static("Checks", classes="section_title")
+                        yield Static("", id="detail_checks")
+                        yield Static("Reviewers", classes="section_title")
+                        yield Static("", id="detail_reviewers")
+                        yield Static("Files", classes="section_title")
+                        yield Static("", id="detail_files")
                 with Vertical(id="chat_col"):
                     with VerticalScroll(id="chat_scroll"):
                         yield Static("", id="chat_log")
