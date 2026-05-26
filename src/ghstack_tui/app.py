@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import sys
 import webbrowser
+
+import ollama as _ollama
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -256,8 +258,8 @@ class GhstackTUI(App):
     #main { height: 1fr; }
     #stacks  { width: 30%; border: solid $accent; }
     #right_col { width: 70%; }
-    #commits { height: 40%; border: solid $accent; }
-    #detail  { height: 60%; border: solid $accent; padding: 0 1; }
+    #commits { height: 3fr; border: solid $accent; }
+    #detail  { height: 4fr; border: solid $accent; padding: 0 1; }
     DataTable { height: 1fr; }
     #status { padding: 0 2; color: $text-muted; height: 1; }
     #detail_header { padding: 0 0 1 0; }
@@ -266,6 +268,10 @@ class GhstackTUI(App):
     .section_title { color: $accent; text-style: bold; padding: 1 0 0 0; }
     #ci_fail_title { display: none; }
     #detail_ci_failures { display: none; padding: 0 0 1 0; }
+    #chat_col { height: 3fr; border: solid $accent; display: none; }
+    #chat_scroll { height: 1fr; }
+    #chat_log { padding: 0 1; }
+    #chat_input { height: 3; border-top: solid $accent-darken-1; }
     """
 
     BINDINGS = [
@@ -281,6 +287,7 @@ class GhstackTUI(App):
         Binding("d", "diff", "Diff"),
         Binding("v", "view_in_editor", "View diff"),
         Binding("o", "open_in_browser", "Open PR"),
+        Binding("ctrl+backslash", "toggle_chat", "Chat"),
         Binding("/", "focus_query", "Edit query"),
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
@@ -295,6 +302,10 @@ class GhstackTUI(App):
         self._enrich_worker: Worker | None = None
         self._detail_worker: Worker | None = None
         self._detail_cache: dict[tuple[str, int], dict] = {}
+        # Chat state
+        self._chat_lines: list[tuple[str, str]] = []   # (role, text)
+        self._chat_streaming: str = ""
+        self._chat_worker: Worker | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -316,6 +327,13 @@ class GhstackTUI(App):
                     yield Static("", id="detail_reviewers")
                     yield Static("Files", classes="section_title")
                     yield Static("", id="detail_files")
+                with Vertical(id="chat_col"):
+                    with VerticalScroll(id="chat_scroll"):
+                        yield Static("", id="chat_log")
+                    yield Input(
+                        placeholder="Ask phi4-mini… (ctrl+\\ to toggle)",
+                        id="chat_input",
+                    )
         yield Static("", id="status")
         yield Footer()
 
@@ -514,6 +532,11 @@ class GhstackTUI(App):
             self.query_str = event.value.strip() or DEFAULT_QUERY
             self.query_one("#stacks", DataTable).focus()
             self._load()
+        elif event.input.id == "chat_input":
+            msg = event.value.strip()
+            if msg:
+                event.input.value = ""
+                self._send_chat(msg)
 
     # --- actions ----------------------------------------------------------
 
@@ -715,6 +738,105 @@ class GhstackTUI(App):
             cmd = f"{diff_cmd} | less -R"
         with self.suspend():
             subprocess.run(["bash", "-c", cmd], check=False)
+
+    # --- ollama chat ------------------------------------------------------
+
+    def action_toggle_chat(self) -> None:
+        """Show/hide the embedded phi4-mini chat panel."""
+        chat_col = self.query_one("#chat_col")
+        chat_col.display = not chat_col.display
+        if chat_col.display:
+            self.query_one("#chat_input", Input).focus()
+
+    def _chat_system_prompt(self) -> str:
+        commit = self._get_selected_commit()
+        if commit is None:
+            return "You are a helpful code-review assistant."
+        parts = [
+            f"You are reviewing PR #{commit.pr_num} in {commit.repo_slug}.",
+            "Answer concisely.",
+        ]
+        if commit.repo_slug and commit.pr_num:
+            cached = self._detail_cache.get((commit.repo_slug, commit.pr_num))
+            if cached:
+                failing = get_failing_jobs(cached)
+                if failing:
+                    parts.append("Failing CI jobs: " + ", ".join(failing))
+        return " ".join(parts)
+
+    def _send_chat(self, msg: str) -> None:
+        self._chat_lines.append(("user", msg))
+        self._chat_streaming = ""
+        self._update_chat_display()
+        if self._chat_worker is not None and self._chat_worker.is_running:
+            self._chat_worker.cancel()
+        self._chat_worker = self.run_worker(
+            self._run_chat(),
+            thread=True,
+            name="ollama-chat",
+        )
+
+    def _run_chat(self):
+        def task() -> None:
+            worker = get_current_worker()
+            system = self._chat_system_prompt()
+            messages = [{"role": "system", "content": system}]
+            for role, text in self._chat_lines:
+                messages.append({"role": role, "content": text})
+            try:
+                stream = _ollama.chat(
+                    model="phi4-mini",
+                    messages=messages,
+                    stream=True,
+                )
+                full = ""
+                for chunk in stream:
+                    if worker.is_cancelled:
+                        return
+                    token = chunk["message"]["content"]
+                    full += token
+                    self.call_from_thread(self._on_chat_token, token)
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._on_chat_done, full)
+            except Exception as exc:  # noqa: BLE001
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._on_chat_error, str(exc))
+        return task
+
+    def _on_chat_token(self, token: str) -> None:
+        self._chat_streaming += token
+        self._update_chat_display()
+
+    def _on_chat_done(self, full_response: str) -> None:
+        self._chat_lines.append(("assistant", full_response))
+        self._chat_streaming = ""
+        self._update_chat_display()
+
+    def _on_chat_error(self, msg: str) -> None:
+        self._chat_streaming = ""
+        self._chat_lines.append(("assistant", f"[Error: {msg}]"))
+        self._update_chat_display()
+        self.notify(f"Ollama error: {msg}", severity="error")
+
+    def _update_chat_display(self) -> None:
+        log = self.query_one("#chat_log", Static)
+        log.update(self._render_chat())
+        self.query_one("#chat_scroll", VerticalScroll).scroll_end(animate=False)
+
+    def _render_chat(self) -> Text:
+        t = Text()
+        for role, text in self._chat_lines:
+            if role == "user":
+                t.append("You: ", style="bold cyan")
+            else:
+                t.append("AI:  ", style="bold green")
+            t.append(text)
+            t.append("\n\n")
+        if self._chat_streaming:
+            t.append("AI:  ", style="bold green")
+            t.append(self._chat_streaming)
+            t.append("▋", style="blink")
+        return t
 
     def _get_selected_commit(self) -> "Commit | None":
         if not self.stacks:
