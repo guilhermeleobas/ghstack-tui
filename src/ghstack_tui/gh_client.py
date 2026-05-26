@@ -193,8 +193,8 @@ def _build_stacks(prs: list[_PR]) -> list[Stack]:
         title = top_pr.title if top_pr else f"#{top_num}"
 
         commits: list[Commit] = []
-        # Reverse to render bottom-to-top (matches what `ghstack land` does).
-        for n in reversed(ordered_top_to_bottom):
+        # Top PR first (highest number), oldest dep last.
+        for n in ordered_top_to_bottom:
             p = by_num.get(n)
             if p is None:
                 commits.append(Commit(
