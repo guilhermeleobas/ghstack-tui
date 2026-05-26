@@ -307,6 +307,8 @@ class GhstackTUI(App):
         self._chat_lines: list[tuple[str, str]] = []   # (role, text)
         self._chat_streaming: str = ""
         self._chat_worker: Worker | None = None
+        # Ollama lifecycle
+        self._ollama_proc: subprocess.Popen | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -348,8 +350,38 @@ class GhstackTUI(App):
         commits_t: DataTable = self.query_one("#commits", DataTable)
         commits_t.add_columns(*self._RIGHT_COLS)
 
+        self._start_ollama()
         self._load()
         stacks_t.focus()
+
+    def _start_ollama(self) -> None:
+        """Start `ollama serve` as a background process if not already running."""
+        if not shutil.which("ollama"):
+            return
+        # Check if already reachable (user may have started it manually).
+        try:
+            import urllib.request
+            urllib.request.urlopen("http://localhost:11434", timeout=1)
+            return  # already up
+        except Exception:
+            pass
+        try:
+            self._ollama_proc = subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        """Shut down the ollama server we started (if any)."""
+        if self._ollama_proc is not None:
+            self._ollama_proc.terminate()
+            try:
+                self._ollama_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._ollama_proc.kill()
 
     # --- data loading -----------------------------------------------------
 
