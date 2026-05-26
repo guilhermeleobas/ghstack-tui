@@ -591,38 +591,46 @@ class GhstackTUI(App):
             return
         commit = self._get_selected_commit()
         expanded = str(Path(repo_path).expanduser())
+        mcp_config_path = None
         if commit is not None:
-            self._write_mcp_config(expanded, commit)
-        cmd = ["claude", prompt] if prompt else ["claude"]
+            mcp_config_path = self._write_mcp_config(expanded, commit)
+        cmd = ["claude"]
+        if mcp_config_path:
+            cmd += ["--mcp-config", mcp_config_path]
+        if prompt:
+            cmd.append(prompt)
         with self.suspend():
             subprocess.run(cmd, cwd=expanded)
 
-    def _write_mcp_config(self, repo_path: str, commit: Commit) -> None:
-        """Write / merge .mcp.json in repo_path so Claude Code loads our MCP server."""
+    def _write_mcp_config(self, repo_path: str, commit: Commit) -> str:
+        """Write MCP config to ~/.config/ghstack-tui/ and return its path."""
         stack = self.stacks[self._current_stack_idx] if self.stacks else None
         stack_prs = [str(c.pr_num) for c in stack.commits if c.pr_num] if stack else []
 
         server_script = str(Path(__file__).parent / "mcp_server.py")
-        config_entry = {
-            "type": "stdio",
-            "command": sys.executable,
-            "args": [
-                server_script,
-                "--repo", commit.repo_slug or "",
-                "--pr", str(commit.pr_num or 0),
-                "--stack", ",".join(stack_prs),
-            ],
+        config = {
+            "mcpServers": {
+                "ghstack-tui": {
+                    "type": "stdio",
+                    "command": sys.executable,
+                    "args": [
+                        server_script,
+                        "--repo", commit.repo_slug or "",
+                        "--pr", str(commit.pr_num or 0),
+                        "--stack", ",".join(stack_prs),
+                    ],
+                }
+            }
         }
 
-        mcp_json = Path(repo_path) / ".mcp.json"
-        existing: dict = {}
-        if mcp_json.exists():
-            try:
-                existing = json.loads(mcp_json.read_text())
-            except Exception:  # noqa: BLE001
-                pass
-        existing.setdefault("mcpServers", {})["ghstack-tui"] = config_entry
-        mcp_json.write_text(json.dumps(existing, indent=2))
+        config_dir = Path.home() / ".config" / "ghstack-tui"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        # Use repo path hash so different repos get distinct configs
+        import hashlib
+        repo_hash = hashlib.sha1(repo_path.encode()).hexdigest()[:8]
+        mcp_json = config_dir / f"{repo_hash}.mcp.json"
+        mcp_json.write_text(json.dumps(config, indent=2))
+        return str(mcp_json)
 
     def action_checkout(self) -> None:
         commit = self._get_selected_commit()
