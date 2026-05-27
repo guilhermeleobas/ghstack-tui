@@ -13,10 +13,22 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label, Markdown, Static
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Markdown,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 from textual.worker import Worker, get_current_worker
 
+from ghstack_tui import clones as clones_mod
 from ghstack_tui import detail as detail_render
+from ghstack_tui.clones import CloneInfo
 from ghstack_tui.detail import get_failing_jobs
 from ghstack_tui.gh_client import (
     DEFAULT_QUERY,
@@ -252,12 +264,14 @@ class GhstackTUI(App):
     """
 
     CSS = """
+    TabbedContent { height: 1fr; }
     #query { dock: top; height: 3; border: solid $accent; }
     #main { height: 1fr; }
     #stacks  { width: 30%; border: solid $accent; }
     #right_col { width: 70%; }
     #commits { height: 40%; border: solid $accent; }
     #detail  { height: 60%; border: solid $accent; padding: 0 1; }
+    #clones_table { height: 1fr; border: solid $accent; }
     DataTable { height: 1fr; }
     #status { padding: 0 2; color: $text-muted; height: 1; }
     #detail_header { padding: 0 0 1 0; }
@@ -282,10 +296,13 @@ class GhstackTUI(App):
         Binding("v", "view_in_editor", "View diff"),
         Binding("o", "open_in_browser", "Open PR"),
         Binding("/", "focus_query", "Edit query"),
+        Binding("t", "toggle_tab", "Tab", priority=True),
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
 
     _RIGHT_COLS = ("PR", "Title", "Labels", "CI", "💬", "±", "Upd")
+    _CLONES_COLS = ("Path", "Branch", "Repo", "PR", "Subject", "✎")
+    _CLONES_PREFIX = "pytorch"
 
     def __init__(self, query: str | None = None) -> None:
         super().__init__()
@@ -295,27 +312,40 @@ class GhstackTUI(App):
         self._enrich_worker: Worker | None = None
         self._detail_worker: Worker | None = None
         self._detail_cache: dict[tuple[str, int], dict] = {}
+        self._clones: list[CloneInfo] = []
+        self._clones_scanned: bool = False
+        self._clones_worker: Worker | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        yield Input(value=self.query_str, placeholder="GitHub PR search query", id="query")
-        with Horizontal(id="main"):
-            yield DataTable(id="stacks", cursor_type="row", zebra_stripes=True)
-            with Vertical(id="right_col"):
-                yield DataTable(id="commits", cursor_type="row", zebra_stripes=True)
-                with VerticalScroll(id="detail"):
-                    yield Static("", id="detail_header")
-                    yield Static("", id="detail_meta")
-                    yield Static("Failing CI", classes="section_title", id="ci_fail_title")
-                    yield Static("", id="detail_ci_failures")
-                    yield Static("Body", classes="section_title")
-                    yield Markdown("", id="detail_body")
-                    yield Static("Checks", classes="section_title")
-                    yield Static("", id="detail_checks")
-                    yield Static("Reviewers", classes="section_title")
-                    yield Static("", id="detail_reviewers")
-                    yield Static("Files", classes="section_title")
-                    yield Static("", id="detail_files")
+        with TabbedContent(initial="tab-stacks", id="tabs"):
+            with TabPane("Stacks", id="tab-stacks"):
+                yield Input(
+                    value=self.query_str,
+                    placeholder="GitHub PR search query",
+                    id="query",
+                )
+                with Horizontal(id="main"):
+                    yield DataTable(id="stacks", cursor_type="row", zebra_stripes=True)
+                    with Vertical(id="right_col"):
+                        yield DataTable(id="commits", cursor_type="row", zebra_stripes=True)
+                        with VerticalScroll(id="detail"):
+                            yield Static("", id="detail_header")
+                            yield Static("", id="detail_meta")
+                            yield Static("Failing CI", classes="section_title", id="ci_fail_title")
+                            yield Static("", id="detail_ci_failures")
+                            yield Static("Body", classes="section_title")
+                            yield Markdown("", id="detail_body")
+                            yield Static("Checks", classes="section_title")
+                            yield Static("", id="detail_checks")
+                            yield Static("Reviewers", classes="section_title")
+                            yield Static("", id="detail_reviewers")
+                            yield Static("Files", classes="section_title")
+                            yield Static("", id="detail_files")
+            with TabPane("Clones", id="tab-clones"):
+                yield DataTable(
+                    id="clones_table", cursor_type="row", zebra_stripes=True
+                )
         yield Static("", id="status")
         yield Footer()
 
@@ -327,6 +357,9 @@ class GhstackTUI(App):
 
         commits_t: DataTable = self.query_one("#commits", DataTable)
         commits_t.add_columns(*self._RIGHT_COLS)
+
+        clones_t: DataTable = self.query_one("#clones_table", DataTable)
+        clones_t.add_columns(*self._CLONES_COLS)
 
         self._load()
         stacks_t.focus()
@@ -509,6 +542,22 @@ class GhstackTUI(App):
             if stack and 0 <= event.cursor_row < len(stack.commits):
                 self._show_detail_for(stack.commits[event.cursor_row])
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "clones_table":
+            return
+        row = event.cursor_row
+        if not (0 <= row < len(self._clones)):
+            return
+        clone = self._clones[row]
+        if clone.pr_num is None:
+            self.notify("No ghstack PR for this clone", severity="warning")
+            return
+        if not self._jump_to_pr(clone.pr_num):
+            self.notify(
+                f"PR #{clone.pr_num} not in current query results",
+                severity="warning",
+            )
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "query":
             self.query_str = event.value.strip() or DEFAULT_QUERY
@@ -548,8 +597,106 @@ class GhstackTUI(App):
             focused.action_cursor_up()
 
     def action_reload(self) -> None:
+        if self._active_tab_id() == "tab-clones":
+            self._clones_scanned = False
+            self._kick_clones_scan()
+            return
         self._detail_cache.clear()
         self._load()
+
+    def action_toggle_tab(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-clones" if tabs.active == "tab-stacks" else "tab-stacks"
+
+    def _active_tab_id(self) -> str:
+        try:
+            return self.query_one("#tabs", TabbedContent).active
+        except Exception:
+            return "tab-stacks"
+
+    # --- clones tab -------------------------------------------------------
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        if event.pane.id == "tab-clones" and not self._clones_scanned:
+            self._kick_clones_scan()
+
+    def _kick_clones_scan(self) -> None:
+        if self._clones_worker is not None and self._clones_worker.is_running:
+            self._clones_worker.cancel()
+        status = self.query_one("#status", Static)
+        status.update(
+            f"Scanning {clones_mod.DEFAULT_ROOT}/{self._CLONES_PREFIX}*…"
+        )
+        clones_t = self.query_one("#clones_table", DataTable)
+        clones_t.clear()
+        self._clones_worker = self.run_worker(
+            self._scan_clones(),
+            thread=True,
+            exclusive=True,
+            name="clones-scan",
+        )
+
+    def _scan_clones(self):
+        def task() -> None:
+            worker = get_current_worker()
+            try:
+                results = clones_mod.scan(
+                    clones_mod.DEFAULT_ROOT, name_prefix=self._CLONES_PREFIX
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not worker.is_cancelled:
+                    self.call_from_thread(self._on_clones_error, str(exc))
+                return
+            if worker.is_cancelled:
+                return
+            self.call_from_thread(self._render_clones, results)
+        return task
+
+    def _render_clones(self, results: list[CloneInfo]) -> None:
+        self._clones = results
+        self._clones_scanned = True
+        try:
+            clones_t = self.query_one("#clones_table", DataTable)
+        except Exception:
+            return  # screen torn down between scan kickoff and render
+        clones_t.clear()
+        for c in results:
+            clones_t.add_row(*_clone_row(c))
+        n_repos = sum(1 for c in results if c.is_git)
+        n_ghstack = sum(1 for c in results if c.is_ghstack)
+        try:
+            self.query_one("#status", Static).update(
+                f"{n_ghstack} ghstack / {n_repos} repos under "
+                f"{clones_mod.DEFAULT_ROOT}/{self._CLONES_PREFIX}*"
+            )
+        except Exception:
+            pass
+
+    def _on_clones_error(self, msg: str) -> None:
+        try:
+            self.query_one("#status", Static).update(
+                Text(f"Clone scan failed: {msg}", style="red")
+            )
+        except Exception:
+            pass
+
+    def _jump_to_pr(self, pr_num: int) -> bool:
+        """Switch to Stacks tab and select the stack containing pr_num. Returns True if found."""
+        for s_idx, stack in enumerate(self.stacks):
+            for c_idx, commit in enumerate(stack.commits):
+                if commit.pr_num == pr_num:
+                    tabs = self.query_one("#tabs", TabbedContent)
+                    tabs.active = "tab-stacks"
+                    stacks_t: DataTable = self.query_one("#stacks", DataTable)
+                    stacks_t.move_cursor(row=s_idx)
+                    stacks_t.focus()
+                    commits_t: DataTable = self.query_one("#commits", DataTable)
+                    if 0 <= c_idx < commits_t.row_count:
+                        commits_t.move_cursor(row=c_idx)
+                    return True
+        return False
 
     def action_ask_claude(self) -> None:
         commit = self._get_selected_commit()
@@ -736,6 +883,28 @@ class GhstackTUI(App):
 
 
 # --- row rendering --------------------------------------------------------
+
+
+def _clone_row(c: CloneInfo) -> tuple:
+    path_txt = Text(c.path.name)
+    if not c.is_git:
+        path_txt.stylize("dim")
+    branch_txt = Text(c.branch) if c.branch else Text(f"({c.head_short})", style="dim")
+    repo_txt = Text(c.repo_slug or "—", style="" if c.repo_slug else "dim")
+    pr_txt = Text(f"#{c.pr_num}" if c.pr_num is not None else "—",
+                  style="" if c.pr_num is not None else "dim")
+    if c.is_ghstack:
+        pr_txt.stylize("cyan")
+    subject = c.error or c.subject
+    dirty = Text("●", style="yellow") if c.dirty else Text("")
+    return (
+        path_txt,
+        branch_txt,
+        repo_txt,
+        pr_txt,
+        _truncate(subject, 60),
+        dirty,
+    )
 
 
 def _row_for(c: Commit) -> tuple:
