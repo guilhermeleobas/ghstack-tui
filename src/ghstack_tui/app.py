@@ -297,6 +297,7 @@ class GhstackTUI(App):
         Binding("o", "open_in_browser", "Open PR"),
         Binding("/", "focus_query", "Edit query"),
         Binding("t", "toggle_tab", "Tab", priority=True),
+        Binding("g", "cd_clone", "cd to clone"),
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
 
@@ -682,6 +683,24 @@ class GhstackTUI(App):
         except Exception:
             pass
 
+    def action_cd_clone(self) -> None:
+        """On clones tab, exit the TUI and signal __main__ to exec a shell in
+        the selected clone directory. A child process can't change its parent
+        shell's cwd, so we replace the python process with a new $SHELL rooted
+        at that path; the user types `exit` to return to the original shell.
+        """
+        if self._active_tab_id() != "tab-clones":
+            return
+        try:
+            clones_t = self.query_one("#clones_table", DataTable)
+        except Exception:
+            return
+        row = clones_t.cursor_row
+        if not (0 <= row < len(self._clones)):
+            return
+        path = str(self._clones[row].path)
+        self.exit(result=("cd", path))
+
     def _jump_to_pr(self, pr_num: int) -> bool:
         """Switch to Stacks tab and select the stack containing pr_num. Returns True if found."""
         for s_idx, stack in enumerate(self.stacks):
@@ -741,11 +760,14 @@ class GhstackTUI(App):
         mcp_config_path = None
         if commit is not None:
             mcp_config_path = self._write_mcp_config(expanded, commit)
+        # `claude --mcp-config <configs...>` is variadic: it greedily consumes
+        # every following positional as another config path. Put the prompt
+        # before --mcp-config so it lands in the [prompt] positional instead.
         cmd = ["claude"]
-        if mcp_config_path:
-            cmd += ["--mcp-config", mcp_config_path]
         if prompt:
             cmd.append(prompt)
+        if mcp_config_path:
+            cmd += ["--mcp-config", mcp_config_path]
         with self.suspend():
             subprocess.run(cmd, cwd=expanded)
 

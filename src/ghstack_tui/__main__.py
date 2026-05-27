@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -48,7 +49,16 @@ def main() -> None:
         query = _arg_to_query(sys.argv[1])
     else:
         query = " ".join(sys.argv[1:])
-    GhstackTUI(query).run()
+    result = GhstackTUI(query).run()
+    if isinstance(result, tuple) and len(result) == 2 and result[0] == "cd":
+        target = result[1]
+        try:
+            os.chdir(target)
+        except OSError as exc:
+            print(f"ghstack-tui: cannot cd to {target}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        os.execvp(shell, [shell])
 
 
 if __name__ == "__main__":
