@@ -28,10 +28,14 @@ from textual.worker import Worker, get_current_worker
 
 from ghstack_tui import clones as clones_mod
 from ghstack_tui import detail as detail_render
+from ghstack_tui import triage as triage_mod
 from ghstack_tui.clones import CloneInfo
 from ghstack_tui.detail import get_failing_jobs
 from ghstack_tui.gh_client import (
     DEFAULT_QUERY,
+    fetch_check_annotations,
+    fetch_drci_failures,
+    fetch_failed_tests,
     fetch_pr_details,
     fetch_pr_diff,
     fetch_pr_full,
@@ -292,16 +296,17 @@ class GhstackTUI(App):
         Binding("r", "reload", "Reload"),
         Binding("c", "checkout", "Checkout"),
         Binding("a", "ask_claude", "Ask Claude"),
+        Binding("f", "show_failing_tests", "Failing tests"),
         Binding("d", "diff", "Diff"),
         Binding("v", "view_in_editor", "View diff"),
         Binding("o", "open_in_browser", "Open PR"),
         Binding("/", "focus_query", "Edit query"),
         Binding("t", "toggle_tab", "Tab", priority=True),
-        Binding("g", "cd_clone", "cd to clone"),
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
 
     _RIGHT_COLS = ("PR", "Title", "Labels", "CI", "💬", "±", "Upd")
+    _STACK_COLS = ("Top PR", "#", "Title")
     _CLONES_COLS = ("Path", "Branch", "Repo", "PR", "Subject", "✎")
     _CLONES_PREFIX = "pytorch"
 
@@ -316,6 +321,13 @@ class GhstackTUI(App):
         self._clones: list[CloneInfo] = []
         self._clones_scanned: bool = False
         self._clones_worker: Worker | None = None
+        self._triage_cache = triage_mod.TriageCache()
+        self._triage_worker: Worker | None = None
+        # (repo_slug, pr_num) -> {check_run_id: [annotation, ...]}
+        self._failing_annotations: dict[tuple[str, int], dict[int, list[dict]]] = {}
+        # (repo_slug, pr_num) -> {job_name: [failure_capture, ...]} from Dr.CI bot.
+        self._drci_failures: dict[tuple[str, int], dict[str, list[str]]] = {}
+        self._annotations_worker: Worker | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -354,7 +366,7 @@ class GhstackTUI(App):
         self.title = "ghstack-tui"
 
         stacks_t: DataTable = self.query_one("#stacks", DataTable)
-        stacks_t.add_columns("Top PR", "#", "Title")
+        stacks_t.add_columns(*self._STACK_COLS)
 
         commits_t: DataTable = self.query_one("#commits", DataTable)
         commits_t.add_columns(*self._RIGHT_COLS)
@@ -379,17 +391,15 @@ class GhstackTUI(App):
         stacks_t: DataTable = self.query_one("#stacks", DataTable)
         stacks_t.clear()
         for s in self.stacks:
-            stacks_t.add_row(
-                f"#{s.top_pr}" if s.top_pr is not None else "—",
-                str(len(s.commits)),
-                _truncate(s.title, 80),
-            )
+            stacks_t.add_row(*_stack_row(s))
 
         if self.stacks:
             status.update(f"{len(self.stacks)} stacks  ({self.query_str})")
         else:
             status.update(f"No ghstack PRs matched: {self.query_str}")
         self._show_stack(0)
+        self._apply_triage_cache_all()
+        self._kick_triage_all()
 
     def _show_stack(self, idx: int) -> None:
         self._current_stack_idx = idx
@@ -434,6 +444,11 @@ class GhstackTUI(App):
                     continue
                 for k, v in detail.items():
                     setattr(c, k, v)
+                c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
+                if c.updated_at:
+                    self._triage_cache.put(
+                        c.repo_slug, c.pr_num, c.updated_at, detail
+                    )
                 self.call_from_thread(self._update_right_row, idx, row_idx, c)
         return task
 
@@ -445,6 +460,94 @@ class GhstackTUI(App):
             return
         for col_idx, val in enumerate(_row_for(c)):
             commits_t.update_cell_at((row_idx, col_idx), val, update_width=False)
+
+    # --- triage (needs-attention badges across all stacks) ---------------
+
+    def _apply_triage_cache_all(self) -> None:
+        """Rehydrate enrichment from cache for every commit, where the cache
+        entry's updated_at matches the PR's current updated_at. This makes
+        badges appear immediately for unchanged PRs without any gh calls.
+        """
+        for stack in self.stacks:
+            for c in stack.commits:
+                if c.repo_slug is None or c.pr_num is None or not c.updated_at:
+                    continue
+                cached = self._triage_cache.get(c.repo_slug, c.pr_num, c.updated_at)
+                if cached is None:
+                    continue
+                for k, v in cached.items():
+                    setattr(c, k, v)
+                c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
+        # Repaint commits table for the currently-shown stack.
+        if 0 <= self._current_stack_idx < len(self.stacks):
+            self._repaint_current_commits()
+
+    def _kick_triage_all(self) -> None:
+        """Background worker: fetch enrichment for every commit not yet
+        cached-and-fresh, in PR-number order. Writes results to the cache.
+        """
+        if self._triage_worker is not None and self._triage_worker.is_running:
+            self._triage_worker.cancel()
+        if not self.stacks:
+            return
+        self._triage_worker = self.run_worker(
+            self._triage_all_task(),
+            thread=True,
+            exclusive=False,
+            name="triage-all",
+        )
+
+    def _triage_all_task(self):
+        def task() -> None:
+            worker = get_current_worker()
+            for s_idx, stack in enumerate(self.stacks):
+                for r_idx, c in enumerate(stack.commits):
+                    if worker.is_cancelled:
+                        return
+                    if c.repo_slug is None or c.pr_num is None:
+                        continue
+                    if c.enriched:
+                        # Already fresh via cache or per-stack enrichment.
+                        continue
+                    try:
+                        detail = fetch_pr_details(c.repo_slug, c.pr_num)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for k, v in detail.items():
+                        setattr(c, k, v)
+                    c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
+                    if c.updated_at:
+                        self._triage_cache.put(
+                            c.repo_slug, c.pr_num, c.updated_at, detail
+                        )
+                    self.call_from_thread(self._on_triage_progress, s_idx, r_idx, c)
+        return task
+
+    def _on_triage_progress(self, s_idx: int, r_idx: int, c: Commit) -> None:
+        # Update the commits table only when this stack is the visible one.
+        if s_idx != self._current_stack_idx:
+            return
+        try:
+            commits_t = self.query_one("#commits", DataTable)
+        except Exception:
+            return
+        if r_idx < commits_t.row_count:
+            for col_idx, val in enumerate(_row_for(c)):
+                commits_t.update_cell_at(
+                    (r_idx, col_idx), val, update_width=False
+                )
+
+    def _repaint_current_commits(self) -> None:
+        try:
+            commits_t = self.query_one("#commits", DataTable)
+        except Exception:
+            return
+        stack = self.stacks[self._current_stack_idx]
+        for r_idx, c in enumerate(stack.commits):
+            if r_idx >= commits_t.row_count:
+                break
+            for col_idx, val in enumerate(_row_for(c)):
+                commits_t.update_cell_at((r_idx, col_idx), val, update_width=False)
 
     # --- background enrichment (detail panel) -----------------------------
 
@@ -521,7 +624,28 @@ class GhstackTUI(App):
 
         ci_fail_title = self.query_one("#ci_fail_title")
         ci_failures = self.query_one("#detail_ci_failures", Static)
-        failures_text = detail_render.render_ci_failures(data)
+        checks = detail_render.get_failing_checks(data)
+        pr_num = data.get("number")
+        commit = self._get_selected_commit()
+        repo_slug = commit.repo_slug if commit and commit.pr_num == pr_num else None
+        drci = (
+            self._drci_failures.get((repo_slug, pr_num), {})
+            if repo_slug is not None and pr_num is not None
+            else {}
+        )
+        annos = (
+            self._failing_annotations.get((repo_slug, pr_num), {})
+            if repo_slug is not None and pr_num is not None
+            else {}
+        )
+        if drci:
+            failures_text = detail_render.render_drci_failures(drci)
+        elif checks and annos:
+            failures_text = detail_render.render_ci_failures_with_annotations(
+                checks, annos
+            )
+        else:
+            failures_text = detail_render.render_ci_failures(data)
         if failures_text is not None:
             ci_failures.update(failures_text)
             ci_fail_title.display = True
@@ -682,24 +806,6 @@ class GhstackTUI(App):
             )
         except Exception:
             pass
-
-    def action_cd_clone(self) -> None:
-        """On clones tab, exit the TUI and signal __main__ to exec a shell in
-        the selected clone directory. A child process can't change its parent
-        shell's cwd, so we replace the python process with a new $SHELL rooted
-        at that path; the user types `exit` to return to the original shell.
-        """
-        if self._active_tab_id() != "tab-clones":
-            return
-        try:
-            clones_t = self.query_one("#clones_table", DataTable)
-        except Exception:
-            return
-        row = clones_t.cursor_row
-        if not (0 <= row < len(self._clones)):
-            return
-        path = str(self._clones[row].path)
-        self.exit(result=("cd", path))
 
     def _jump_to_pr(self, pr_num: int) -> bool:
         """Switch to Stacks tab and select the stack containing pr_num. Returns True if found."""
@@ -865,6 +971,132 @@ class GhstackTUI(App):
         webbrowser.open(commit.url)
         self.notify(f"Opened {commit.url}", title="Browser")
 
+    def action_show_failing_tests(self) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.repo_slug is None or commit.pr_num is None:
+            self.notify("No PR selected", severity="warning")
+            return
+        cached = self._detail_cache.get((commit.repo_slug, commit.pr_num))
+        if cached is None:
+            self.notify("Detail not loaded yet — wait a moment", severity="warning")
+            return
+        checks = detail_render.get_failing_checks(cached)
+        if not checks:
+            self.notify("No failing CI", severity="information")
+            return
+        self._kick_annotations(commit.repo_slug, commit.pr_num, checks)
+
+    def _kick_annotations(
+        self, repo_slug: str, pr_num: int, checks: list[dict]
+    ) -> None:
+        if self._annotations_worker is not None and self._annotations_worker.is_running:
+            self._annotations_worker.cancel()
+        # Show jobs immediately with "(loading)" via fallback render; the worker
+        # will repaint as annotations arrive.
+        self._render_annotations(repo_slug, pr_num, checks)
+        self.notify(f"Fetching annotations for {len(checks)} job(s)…")
+        self._annotations_worker = self.run_worker(
+            self._fetch_annotations(repo_slug, pr_num, checks),
+            thread=True,
+            exclusive=True,
+            name=f"annotations-{pr_num}",
+        )
+
+    def _fetch_annotations(
+        self, repo_slug: str, pr_num: int, checks: list[dict]
+    ):
+        def task() -> None:
+            worker = get_current_worker()
+            key = (repo_slug, pr_num)
+            # Try Dr.CI first — pytorch-bot publishes a structured failure
+            # summary with the actual test invocations under each job. One
+            # `gh pr view` call covers the whole PR.
+            if key not in self._drci_failures:
+                try:
+                    self._drci_failures[key] = fetch_drci_failures(
+                        repo_slug, pr_num
+                    )
+                except Exception:  # noqa: BLE001
+                    self._drci_failures[key] = {}
+            if worker.is_cancelled:
+                return
+            if self._drci_failures[key]:
+                self.call_from_thread(
+                    self._render_drci_failures, repo_slug, pr_num
+                )
+                return
+            # Fallback: per-check annotations + log scrape for repos without
+            # a Dr.CI comment.
+            bucket = self._failing_annotations.setdefault(key, {})
+            for c in checks:
+                if worker.is_cancelled:
+                    return
+                cid = c.get("check_run_id")
+                if cid is None or cid in bucket:
+                    continue
+                try:
+                    raw = fetch_check_annotations(repo_slug, cid)
+                except Exception:  # noqa: BLE001
+                    raw = []
+                # Keep only real failures — drop workflow warnings/notices
+                # (e.g. "Node.js 20 actions are deprecated").
+                annos = [
+                    a for a in raw
+                    if (a.get("annotation_level") or "").lower() == "failure"
+                ]
+                if not annos:
+                    # Fall back to log scrape — pytorch CI logs pytest failures
+                    # instead of emitting them as annotations.
+                    try:
+                        tests = fetch_failed_tests(repo_slug, cid)
+                    except Exception:  # noqa: BLE001
+                        tests = []
+                    annos = [
+                        {
+                            "path": None,
+                            "start_line": None,
+                            "annotation_level": "failure",
+                            "title": tid,
+                            "message": "",
+                        }
+                        for tid in tests
+                    ]
+                bucket[cid] = annos
+                self.call_from_thread(
+                    self._render_annotations, repo_slug, pr_num, checks
+                )
+        return task
+
+    def _render_annotations(
+        self, repo_slug: str, pr_num: int, checks: list[dict]
+    ) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.repo_slug != repo_slug or commit.pr_num != pr_num:
+            return  # cursor moved; don't clobber the new PR's panel
+        annos = self._failing_annotations.get((repo_slug, pr_num), {})
+        text = detail_render.render_ci_failures_with_annotations(checks, annos)
+        if text is None:
+            return
+        ci_failures = self.query_one("#detail_ci_failures", Static)
+        ci_fail_title = self.query_one("#ci_fail_title")
+        ci_failures.update(text)
+        ci_fail_title.display = True
+        ci_failures.display = True
+
+    def _render_drci_failures(self, repo_slug: str, pr_num: int) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.repo_slug != repo_slug or commit.pr_num != pr_num:
+            return
+        drci = self._drci_failures.get((repo_slug, pr_num), {})
+        text = detail_render.render_drci_failures(drci)
+        if text is None:
+            return
+        ci_failures = self.query_one("#detail_ci_failures", Static)
+        ci_fail_title = self.query_one("#ci_fail_title")
+        ci_failures.update(text)
+        ci_fail_title.display = True
+        ci_failures.display = True
+
     def action_diff(self) -> None:
         commit = self._get_selected_commit()
         if commit is None or commit.pr_num is None or commit.repo_slug is None:
@@ -942,6 +1174,14 @@ def _row_for(c: Commit) -> tuple:
         str(c.comments_count) if c.comments_count else "",
         _diff_pretty(c),
         _rel_time(c.updated_at),
+    )
+
+
+def _stack_row(s: Stack) -> tuple:
+    return (
+        f"#{s.top_pr}" if s.top_pr is not None else "—",
+        str(len(s.commits)),
+        _truncate(s.title, 80),
     )
 
 

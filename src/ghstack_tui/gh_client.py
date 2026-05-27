@@ -139,6 +139,121 @@ def fetch_pr_diff(repo_slug: str, pr_num: int) -> str:
     return proc.stdout
 
 
+def fetch_check_annotations(repo_slug: str, check_run_id: int) -> list[dict]:
+    """Return annotations for a check-run (e.g. pytest failures emitted as
+    GitHub Actions annotations). Each item has keys like `path`, `start_line`,
+    `annotation_level`, `message`, `title`. Empty list if the workflow didn't
+    emit annotations or the call fails.
+    """
+    proc = subprocess.run(
+        ["gh", "api", f"/repos/{repo_slug}/check-runs/{check_run_id}/annotations"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+# Dr.CI bot job line:
+#   "* [linux-foo / test (default, 1, 5, ...)](https://hud...) ([gh](https://github.com/...))"
+# May be prefixed with the pending icon ":hourglass_flowing_sand: ".
+_DRCI_JOB_RE = re.compile(
+    r"^\*\s+(?::hourglass_flowing_sand:\s+)?\[([^\]]+)\]\([^)]+\)"
+)
+# Indented backticked failure capture under a job bullet:
+#   "    `python test_foo.py TestBar.test_baz`"
+_DRCI_CAPTURE_RE = re.compile(r"^\s{2,}`(.+)`\s*$")
+
+
+def fetch_drci_failures(repo_slug: str, pr_num: int) -> dict[str, list[str]]:
+    """Parse the pytorch-bot Dr.CI PR comment for failing job → failure captures.
+
+    HUD's failure classifier writes these into the comment as backticked code
+    lines under each ``* [<job>](...)`` bullet — exactly the test invocations
+    shown on hud.pytorch.org. Works for repos where pytorch-bot posts a Dr.CI
+    comment (pytorch/pytorch et al.). Empty dict otherwise.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh", "pr", "view", str(pr_num),
+                "--repo", repo_slug,
+                "--json", "comments",
+                "--jq",
+                '.comments[] | select(.author.login=="pytorch-bot") | .body',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+    if proc.returncode != 0:
+        return {}
+    body = proc.stdout
+    if not body or "No Failures" in body:
+        return {}
+    result: dict[str, list[str]] = {}
+    current_job: str | None = None
+    for line in body.splitlines():
+        m = _DRCI_JOB_RE.match(line)
+        if m:
+            current_job = m.group(1)
+            result.setdefault(current_job, [])
+            continue
+        m = _DRCI_CAPTURE_RE.match(line)
+        if m and current_job:
+            result[current_job].append(m.group(1))
+    return result
+
+
+# pytest summary line: "FAILED test_foo.py::TestBar::test_baz - AssertionError: ..."
+# also -v form:        "test_foo.py::TestBar::test_baz FAILED"
+# and with duration:   "FAILED [0.0181s] test_foo.py::TestBar::test_baz"
+_PYTEST_FAILED_RE_A = re.compile(
+    r"FAILED(?:\s+\[[\d.]+s\])?\s+([A-Za-z_0-9./\\-]+\.py::\S+?)(?:\s+-|\s*$)"
+)
+_PYTEST_FAILED_RE_B = re.compile(
+    r"([A-Za-z_0-9./\\-]+\.py::\S+?)\s+FAILED\b"
+)
+
+
+def fetch_failed_tests(repo_slug: str, check_run_id: int, timeout: int = 90) -> list[str]:
+    """Scrape `gh run view --log-failed --job <id>` for pytest failure markers.
+
+    Returns deduped, order-preserving list of test IDs (e.g.
+    "test_foo.py::TestBar::test_baz"). Empty list on error/timeout or when
+    no pytest-style failures appear in the log.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "run", "view", "--job", str(check_run_id),
+             "--log-failed", "--repo", repo_slug],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return []
+    if proc.returncode != 0:
+        return []
+    seen: dict[str, None] = {}
+    for line in proc.stdout.splitlines():
+        for rx in (_PYTEST_FAILED_RE_A, _PYTEST_FAILED_RE_B):
+            m = rx.search(line)
+            if m:
+                tid = m.group(1).rstrip(":,")
+                if tid and tid not in seen:
+                    seen[tid] = None
+                break
+    return list(seen)
+
+
 def _parse_stack_block(body: str) -> tuple[int, ...]:
     """Extract the ordered PR list from a ghstack 'Stack from' block.
 

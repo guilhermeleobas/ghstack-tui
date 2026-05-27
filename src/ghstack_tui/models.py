@@ -28,6 +28,10 @@ class Commit:
     review_decision: str = ""
     enriched: bool = False
 
+    # filled from triage rules once enrichment lands
+    verdict: str = "ok"          # one of: attention, ready, waiting, draft, ok
+    verdict_reason: str = ""
+
 
 @dataclass
 class Stack:

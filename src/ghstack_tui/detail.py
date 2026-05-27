@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from rich.text import Text
 
 _FAIL_CONCLUSIONS = {
@@ -9,24 +11,58 @@ _FAIL_CONCLUSIONS = {
     "ACTION_REQUIRED", "STARTUP_FAILURE",
 }
 
+# Actions detailsUrl looks like:
+#   https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>
+# The job_id is also the check-run id for the annotations API.
+_JOB_ID_RE = re.compile(r"/job/(\d+)")
+
+
+def _check_run_id_from_url(url: str) -> int | None:
+    if not url:
+        return None
+    m = _JOB_ID_RE.search(url)
+    return int(m.group(1)) if m else None
+
 
 def get_failing_jobs(data: dict) -> list[str]:
     """Return names of failing CI jobs (empty list if none)."""
+    return [c["label"] for c in get_failing_checks(data)]
+
+
+def get_failing_checks(data: dict) -> list[dict]:
+    """Return failing CI checks with id + label.
+
+    Each item: ``{"label": str, "check_run_id": int | None, "details_url": str | None}``.
+    ``check_run_id`` is parsed from ``detailsUrl`` (Actions workflow jobs only); it's
+    ``None`` for status contexts and any CheckRun without a recognizable URL.
+    """
     rollup = data.get("statusCheckRollup") or []
-    failing: list[str] = []
+    out: list[dict] = []
     for c in rollup:
         status = (c.get("status") or "").upper()
         conclusion = (c.get("conclusion") or "").upper()
-        if status != "COMPLETED" or conclusion not in _FAIL_CONCLUSIONS:
-            continue
         if c.get("__typename") == "CheckRun":
+            if status != "COMPLETED" or conclusion not in _FAIL_CONCLUSIONS:
+                continue
             name = c.get("name") or "?"
             wf = c.get("workflowName")
             label = f"{wf} / {name}" if wf and wf != name else name
+            details_url = c.get("detailsUrl") or ""
+            out.append({
+                "label": label,
+                "check_run_id": _check_run_id_from_url(details_url),
+                "details_url": details_url or None,
+            })
         else:
-            label = c.get("context") or c.get("name") or "?"
-        failing.append(label)
-    return failing
+            state = (c.get("state") or "").upper()
+            if state not in _FAIL_CONCLUSIONS:
+                continue
+            out.append({
+                "label": c.get("context") or c.get("name") or "?",
+                "check_run_id": None,
+                "details_url": c.get("targetUrl") or None,
+            })
+    return out
 
 
 def render_ci_failures(data: dict) -> "Text | None":
@@ -40,6 +76,93 @@ def render_ci_failures(data: dict) -> "Text | None":
         t.append(job)
         t.append("\n")
     t.rstrip()
+    return t
+
+
+_ANNOTATION_STYLE = {
+    "failure": "red",
+    "warning": "yellow",
+    "notice": "cyan",
+}
+
+
+def render_drci_failures(drci_map: dict[str, list[str]]) -> "Text | None":
+    """Render Dr.CI's failing-job → failure-captures map.
+
+    Each job becomes a ``✗ <job>`` line with the failure captures
+    (typically test invocations) indented underneath. Jobs with no
+    captures show a dim placeholder.
+    """
+    if not drci_map:
+        return None
+    t = Text()
+    items = sorted(drci_map.items())
+    for i, (job, captures) in enumerate(items):
+        if i:
+            t.append("\n")
+        t.append("✗ ", style="bold red")
+        t.append(job)
+        if not captures:
+            t.append("\n    (no captured failure)", style="dim")
+            continue
+        for cap in captures:
+            t.append("\n    ")
+            t.append(cap, style="red")
+    return t
+
+
+def render_ci_failures_with_annotations(
+    checks: list[dict],
+    annotations_by_id: dict[int, list[dict]],
+) -> "Text | None":
+    """Like ``render_ci_failures`` but adds indented annotation lines under each job.
+
+    ``annotations_by_id`` maps ``check_run_id`` to the list returned by
+    ``gh_client.fetch_check_annotations``. A status that hasn't been fetched
+    yet (no key) renders as ``(press F to load)``; an empty list renders as
+    ``(no annotations)``.
+    """
+    if not checks:
+        return None
+    t = Text()
+    for i, c in enumerate(checks):
+        if i:
+            t.append("\n")
+        t.append("✗ ", style="bold red")
+        t.append(c["label"])
+        cid = c.get("check_run_id")
+        if cid is None:
+            t.append("\n")
+            t.append("    (no annotations API for status check)", style="dim")
+            continue
+        if cid not in annotations_by_id:
+            continue
+        annos = annotations_by_id[cid]
+        if not annos:
+            t.append("\n")
+            t.append("    (no annotations)", style="dim")
+            continue
+        for a in annos[:10]:
+            level = (a.get("annotation_level") or "").lower()
+            style = _ANNOTATION_STYLE.get(level, "")
+            t.append("\n")
+            t.append("    ")
+            path = a.get("path") or ""
+            line = a.get("start_line")
+            if path:
+                loc = f"{path}:{line}" if line else path
+                t.append(loc, style="bold")
+                t.append("  ")
+            title = a.get("title") or ""
+            if title:
+                t.append(title, style=style or "bold")
+                t.append("  ")
+            msg = (a.get("message") or "").strip().splitlines()
+            if msg:
+                t.append(msg[0], style=style)
+        if len(annos) > 10:
+            t.append("\n")
+            t.append(f"    … +{len(annos) - 10} more annotations", style="dim")
     return t
 
 
