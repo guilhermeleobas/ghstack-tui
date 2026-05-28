@@ -20,6 +20,7 @@ import json
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 
 from ghstack_tui.models import Commit, Stack
@@ -28,6 +29,76 @@ _STACK_HEADER_RE = re.compile(r"Stack from \[ghstack\]\([^)]*\)[^:\n]*:", re.IGN
 _STACK_PR_RE = re.compile(r"^\s*\*\s+(?:__->__\s+)?#(\d+)\s*$", re.MULTILINE)
 
 DEFAULT_QUERY = "is:pr is:open author:@me"
+
+
+# --- subprocess wrapper ----------------------------------------------------
+
+# Substrings that mark a transient GitHub/network error worth retrying.
+# Sourced from observed `gh` stderr output: 5xx upstream, rate-limit hiccups,
+# DNS/TLS resets that resolve on retry.
+_TRANSIENT_MARKERS = (
+    "HTTP 502",
+    "HTTP 503",
+    "HTTP 504",
+    "HTTP 500",
+    "timeout",
+    "Timeout",
+    "TLS handshake",
+    "EOF",
+    "connection reset",
+    "no such host",
+    "i/o timeout",
+    "temporary failure",
+    "Server Error",
+    "Bad Gateway",
+)
+
+
+class GhError(RuntimeError):
+    """A `gh` subprocess invocation failed (returncode != 0). stderr in args[0]."""
+
+
+def _is_transient(stderr: str) -> bool:
+    return any(m in stderr for m in _TRANSIENT_MARKERS)
+
+
+def _gh(
+    args: list[str],
+    *,
+    check: bool = True,
+    timeout: float | None = None,
+    retries: int = 2,
+    retry_backoff: float = 0.8,
+) -> subprocess.CompletedProcess:
+    """Run `gh <args>` with retry on transient errors.
+
+    Returns the CompletedProcess. If ``check`` is True, raises ``GhError`` on
+    non-zero exit (after exhausting retries). Always captures stdout/stderr
+    as text. ``timeout`` is per attempt.
+    """
+    cmd = ["gh", *args]
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(retries + 1):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            if attempt < retries:
+                time.sleep(retry_backoff * (2 ** attempt))
+                continue
+            raise
+        last = proc
+        if proc.returncode == 0:
+            return proc
+        if attempt < retries and _is_transient(proc.stderr):
+            time.sleep(retry_backoff * (2 ** attempt))
+            continue
+        break
+    assert last is not None
+    if check:
+        raise GhError(last.stderr.strip() or f"gh exited {last.returncode}")
+    return last
 
 
 @dataclass
@@ -47,13 +118,13 @@ def _run_gh_search(query: str, limit: int) -> list[dict]:
     as it appears in the GitHub UI (e.g. `is:pr is:open author:@me repo:foo/bar`).
     """
     tokens = shlex.split(query)
-    cmd = [
-        "gh", "search", "prs",
+    args = [
+        "search", "prs",
         *tokens,
         "--json", "number,title,body,isDraft,url,labels,commentsCount,updatedAt,repository",
         "--limit", str(limit),
     ]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    proc = _gh(args)
     return json.loads(proc.stdout)
 
 
@@ -86,12 +157,11 @@ def _summarize_rollup(rollup: list[dict]) -> tuple[int, int, int]:
 
 def fetch_pr_details(repo_slug: str, pr_num: int) -> dict:
     """Fetch CI + diff summary for one PR (row enrichment)."""
-    cmd = [
-        "gh", "pr", "view", str(pr_num),
+    proc = _gh([
+        "pr", "view", str(pr_num),
         "--repo", repo_slug,
         "--json", "statusCheckRollup,additions,deletions,changedFiles,reviewDecision",
-    ]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    ])
     data = json.loads(proc.stdout)
     ok, fail, pending = _summarize_rollup(data.get("statusCheckRollup") or [])
     return {
@@ -111,8 +181,8 @@ def fetch_pr_full(repo_slug: str, pr_num: int) -> dict:
 
     Returned dict keys match the `gh pr view --json` field names.
     """
-    cmd = [
-        "gh", "pr", "view", str(pr_num),
+    proc = _gh([
+        "pr", "view", str(pr_num),
         "--repo", repo_slug,
         "--json",
         ",".join([
@@ -121,21 +191,15 @@ def fetch_pr_full(repo_slug: str, pr_num: int) -> dict:
             "baseRefName", "headRefName",
             "additions", "deletions", "changedFiles", "files",
             "statusCheckRollup", "reviewDecision", "reviewRequests", "reviews",
-            "mergeable", "labels",
+            "mergeable", "mergeStateStatus", "autoMergeRequest", "labels",
         ]),
-    ]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    ])
     return json.loads(proc.stdout)
 
 
 def fetch_pr_diff(repo_slug: str, pr_num: int) -> str:
     """Return unified diff text for the given PR via `gh pr diff`."""
-    proc = subprocess.run(
-        ["gh", "pr", "diff", str(pr_num), "--repo", repo_slug],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    proc = _gh(["pr", "diff", str(pr_num), "--repo", repo_slug])
     return proc.stdout
 
 
@@ -145,10 +209,9 @@ def fetch_check_annotations(repo_slug: str, check_run_id: int) -> list[dict]:
     `annotation_level`, `message`, `title`. Empty list if the workflow didn't
     emit annotations or the call fails.
     """
-    proc = subprocess.run(
-        ["gh", "api", f"/repos/{repo_slug}/check-runs/{check_run_id}/annotations"],
-        capture_output=True,
-        text=True,
+    proc = _gh(
+        ["api", f"/repos/{repo_slug}/check-runs/{check_run_id}/annotations"],
+        check=False,
     )
     if proc.returncode != 0:
         return []
@@ -179,16 +242,15 @@ def fetch_drci_failures(repo_slug: str, pr_num: int) -> dict[str, list[str]]:
     comment (pytorch/pytorch et al.). Empty dict otherwise.
     """
     try:
-        proc = subprocess.run(
+        proc = _gh(
             [
-                "gh", "pr", "view", str(pr_num),
+                "pr", "view", str(pr_num),
                 "--repo", repo_slug,
                 "--json", "comments",
                 "--jq",
                 '.comments[] | select(.author.login=="pytorch-bot") | .body',
             ],
-            capture_output=True,
-            text=True,
+            check=False,
             timeout=30,
         )
     except subprocess.TimeoutExpired:
@@ -212,6 +274,74 @@ def fetch_drci_failures(repo_slug: str, pr_num: int) -> dict[str, list[str]]:
     return result
 
 
+_MERGE_BOT_LOGINS = {
+    "pytorch-merge-bot",
+    "pytorch-bot",
+    "github-actions",
+    "mergify",
+    "mergify[bot]",
+    "github-merge-queue",
+}
+
+# Login -> body-pattern -> (label, style). Patterns checked in order; first
+# match wins. Style uses Rich markup understood by detail.render_header.
+_MERGE_SIGNAL_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
+    (re.compile(r"Successfully merged", re.I), "merged", "bold magenta"),
+    (re.compile(r"Merge failed", re.I), "merge failed", "bold red"),
+    (re.compile(r"Reverting PR|This PR was reverted|Successfully reverted",
+                re.I), "reverted", "bold red"),
+    (re.compile(r"Merge started", re.I), "merging", "bold cyan"),
+    (re.compile(r"added to the merge queue|Adding the PR to the merge queue",
+                re.I), "queued", "bold cyan"),
+    (re.compile(r"@pytorchbot\s+merge", re.I), "merge requested", "bold cyan"),
+]
+
+
+def fetch_merge_signal(repo_slug: str, pr_num: int) -> dict | None:
+    """Scan recent PR comments for a merge-bot status signal.
+
+    Returns ``{"label": str, "style": str, "author": str}`` for the most
+    recent matching bot comment, or None if no signal is found. The intent is
+    to surface "merging / merge failed / reverted" states that aren't visible
+    from ``mergeStateStatus`` alone — e.g. pytorch's land workflow runs
+    asynchronously via ``@pytorchbot merge`` comments.
+    """
+    try:
+        proc = _gh(
+            [
+                "pr", "view", str(pr_num),
+                "--repo", repo_slug,
+                "--json", "comments",
+            ],
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    comments = data.get("comments") or []
+    # Walk newest-first; gh returns oldest-first.
+    for c in reversed(comments):
+        author = ((c.get("author") or {}).get("login") or "").lower()
+        body = c.get("body") or ""
+        is_bot = (
+            author in _MERGE_BOT_LOGINS
+            or author.endswith("-bot")
+            or author.endswith("[bot]")
+        )
+        # Also consider user-issued `@pytorchbot merge` requests, which signal
+        # a pending land even before the bot replies.
+        for rx, label, style in _MERGE_SIGNAL_PATTERNS:
+            if rx.search(body) and (is_bot or label == "merge requested"):
+                return {"label": label, "style": style, "author": author}
+    return None
+
+
 # pytest summary line: "FAILED test_foo.py::TestBar::test_baz - AssertionError: ..."
 # also -v form:        "test_foo.py::TestBar::test_baz FAILED"
 # and with duration:   "FAILED [0.0181s] test_foo.py::TestBar::test_baz"
@@ -231,11 +361,10 @@ def fetch_failed_tests(repo_slug: str, check_run_id: int, timeout: int = 90) -> 
     no pytest-style failures appear in the log.
     """
     try:
-        proc = subprocess.run(
-            ["gh", "run", "view", "--job", str(check_run_id),
+        proc = _gh(
+            ["run", "view", "--job", str(check_run_id),
              "--log-failed", "--repo", repo_slug],
-            capture_output=True,
-            text=True,
+            check=False,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:

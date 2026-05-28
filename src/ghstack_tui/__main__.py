@@ -1,9 +1,10 @@
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from ghstack_tui.app import GhstackTUI
-from ghstack_tui.gh_client import DEFAULT_QUERY
+from ghstack_tui.config import Config
 
 
 def _git_repo_slug(path: Path) -> str | None:
@@ -16,12 +17,11 @@ def _git_repo_slug(path: Path) -> str | None:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
     # Match `git@github.com:owner/name(.git)?` and `https://github.com/owner/name(.git)?`.
-    import re
     m = re.search(r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?/?$", url)
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
-def _arg_to_query(arg: str) -> str:
+def _arg_to_query(arg: str, default_query: str) -> str:
     """Turn a single CLI arg into a GitHub-search query.
 
     - "is:pr is:open ..." (contains `:`) → used verbatim
@@ -35,17 +35,18 @@ def _arg_to_query(arg: str) -> str:
     if p.is_dir():
         slug = _git_repo_slug(p)
         if slug:
-            return f"{DEFAULT_QUERY} repo:{slug}"
+            return f"{default_query} repo:{slug}"
     if arg.count("/") == 1 and not arg.startswith("/"):
-        return f"{DEFAULT_QUERY} repo:{arg}"
+        return f"{default_query} repo:{arg}"
     return arg
 
 
 def main() -> None:
+    cfg = Config.load()
     if len(sys.argv) == 1:
         query: str | None = None
     elif len(sys.argv) == 2:
-        query = _arg_to_query(sys.argv[1])
+        query = _arg_to_query(sys.argv[1], cfg.default_query)
     else:
         query = " ".join(sys.argv[1:])
     GhstackTUI(query).run()

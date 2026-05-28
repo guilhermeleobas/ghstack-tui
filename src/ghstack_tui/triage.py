@@ -5,21 +5,22 @@ for the commits table. Caching keys on `updatedAt`: GitHub bumps it on any PR
 activity (commit push, comment, review, CI rerun), so a cache hit means
 nothing has changed and the stored verdict is still valid.
 
-Cache file: ~/.config/ghstack-tui/triage-cache.json
+Cache file: ~/.config/ghstack-tui/triage-cache.json (override with GHSTACK_TUI_ROOT).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ghstack_tui import paths
+
 if TYPE_CHECKING:
     from ghstack_tui.models import Commit
 
-
-CACHE_PATH = Path.home() / ".config" / "ghstack-tui" / "triage-cache.json"
 
 # Verdict severity ordering. Higher index = more urgent.
 _SEVERITY = {"ok": 0, "draft": 1, "waiting": 2, "ready": 3, "attention": 4}
@@ -81,8 +82,8 @@ def worst(verdicts: list[str]) -> str:
 class TriageCache:
     """Thread-safe JSON cache for PR enrichment data, keyed by (repo, pr, updatedAt)."""
 
-    def __init__(self, path: Path = CACHE_PATH) -> None:
-        self._path = path
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path if path is not None else paths.cache_path()
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
         self._load()
@@ -98,9 +99,13 @@ class TriageCache:
             self._data = {}
 
     def _save_locked(self) -> None:
+        # Atomic write: tmp + os.replace. A SIGKILL or full disk mid-write
+        # leaves the original cache intact; partial JSON would corrupt it.
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._data, indent=2))
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._data, indent=2))
+            os.replace(tmp, self._path)
         except OSError:
             pass  # cache is best-effort
 

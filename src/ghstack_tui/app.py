@@ -1,10 +1,10 @@
+import hashlib
 import json
 import shlex
 import shutil
 import subprocess
 import sys
 import webbrowser
-from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.markup import escape as markup_escape
@@ -12,13 +12,11 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
     Input,
-    Label,
     Markdown,
     Static,
     TabbedContent,
@@ -28,231 +26,26 @@ from textual.worker import Worker, get_current_worker
 
 from ghstack_tui import clones as clones_mod
 from ghstack_tui import detail as detail_render
+from ghstack_tui import paths
+from ghstack_tui import render as render_mod
 from ghstack_tui import triage as triage_mod
 from ghstack_tui.clones import CloneInfo
+from ghstack_tui.config import Config
 from ghstack_tui.detail import get_failing_jobs
 from ghstack_tui.gh_client import (
     DEFAULT_QUERY,
+    GhError,
     fetch_check_annotations,
     fetch_drci_failures,
     fetch_failed_tests,
+    fetch_merge_signal,
     fetch_pr_details,
     fetch_pr_diff,
     fetch_pr_full,
     load_stacks,
 )
 from ghstack_tui.models import Commit, Stack
-
-
-_DEFAULT_CHECKOUT_PATH = "~/git/pytorch313"
-
-
-class CheckoutModal(ModalScreen):
-    """Floating dialog: enter repo path, then run ghstack checkout <pr_num>."""
-
-    DEFAULT_CSS = """
-    CheckoutModal {
-        align: center middle;
-    }
-    #_co_box {
-        width: 64;
-        height: auto;
-        border: thick $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #_co_title { text-style: bold; margin-bottom: 1; }
-    #_co_hint  { color: $text-muted; margin-top: 1; }
-    """
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
-
-    def __init__(self, pr_num: int, repo_slug: str | None) -> None:
-        super().__init__()
-        self._pr_num = pr_num
-        self._repo_slug = repo_slug or "?"
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="_co_box"):
-            yield Label(
-                f"ghstack checkout  PR #{self._pr_num}  ({self._repo_slug})",
-                id="_co_title",
-            )
-            yield Input(
-                value=_DEFAULT_CHECKOUT_PATH,
-                placeholder="Path to repo",
-                id="_co_input",
-            )
-            yield Label("↵ confirm   esc cancel", id="_co_hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#_co_input", Input).focus()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip() or None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class DiffModal(ModalScreen):
-    """Full-screen diff overlay. Fetches `gh pr diff` in background, renders colored."""
-
-    DEFAULT_CSS = """
-    DiffModal { align: center middle; }
-    #_dm_box {
-        width: 98%;
-        height: 95%;
-        border: thick $accent;
-        background: $surface;
-    }
-    #_dm_header {
-        height: 2;
-        padding: 0 1;
-        background: $panel;
-    }
-    #_dm_title  { text-style: bold; }
-    #_dm_status { color: $text-muted; }
-    #_dm_scroll { height: 1fr; }
-    #_dm_text   { padding: 0 1; }
-    """
-
-    BINDINGS = [
-        Binding("q", "close", "Close"),
-        Binding("escape", "close", "Close"),
-        Binding("j", "scroll_down", "↓", show=False),
-        Binding("k", "scroll_up", "↑", show=False),
-    ]
-
-    def __init__(self, pr_num: int, repo_slug: str, subject: str = "") -> None:
-        super().__init__()
-        self._pr_num = pr_num
-        self._repo_slug = repo_slug
-        self._subject = subject
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="_dm_box"):
-            with Horizontal(id="_dm_header"):
-                yield Label(
-                    f"Diff  PR #{self._pr_num}  ({self._repo_slug})"
-                    + (f"  {self._subject[:60]}" if self._subject else ""),
-                    id="_dm_title",
-                )
-                yield Label("Loading…", id="_dm_status")
-            with VerticalScroll(id="_dm_scroll"):
-                yield Static("", id="_dm_text")
-
-    def on_mount(self) -> None:
-        self.run_worker(self._fetch(), thread=True, name="diff-fetch")
-
-    def _fetch(self):
-        def task() -> None:
-            worker = get_current_worker()
-            try:
-                raw = fetch_pr_diff(self._repo_slug, self._pr_num)
-            except Exception as exc:  # noqa: BLE001
-                if not worker.is_cancelled:
-                    self.app.call_from_thread(self._on_error, str(exc))
-                return
-            if not worker.is_cancelled:
-                self.app.call_from_thread(self._on_ready, raw)
-        return task
-
-    def _on_ready(self, raw: str) -> None:
-        lines = raw.count("\n")
-        self.query_one("#_dm_status", Label).update(
-            Text(f"{lines} lines   q/esc close", style="dim")
-        )
-        self.query_one("#_dm_text", Static).update(_render_diff(raw))
-
-    def _on_error(self, msg: str) -> None:
-        self.query_one("#_dm_status", Label).update(
-            Text(f"Error: {msg}", style="red")
-        )
-
-    def action_close(self) -> None:
-        self.dismiss()
-
-    def action_scroll_down(self) -> None:
-        self.query_one("#_dm_scroll", VerticalScroll).scroll_relative(y=3)
-
-    def action_scroll_up(self) -> None:
-        self.query_one("#_dm_scroll", VerticalScroll).scroll_relative(y=-3)
-
-
-class _AskClaudeModal(ModalScreen):
-    """Floating dialog: show failing CI context, pick repo path + initial prompt, spawn claude."""
-
-    DEFAULT_CSS = """
-    _AskClaudeModal { align: center middle; }
-    #_cc_box {
-        width: 80;
-        height: auto;
-        border: thick $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #_cc_title   { text-style: bold; margin-bottom: 1; }
-    #_cc_failing { color: $error; margin-bottom: 1; }
-    .cc_lbl      { color: $text-muted; margin-top: 1; }
-    #_cc_hint    { color: $text-muted; margin-top: 1; }
-    """
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
-
-    def __init__(
-        self,
-        pr_num: int | None,
-        repo_slug: str | None,
-        failing: list[str],
-        default_prompt: str = "",
-    ) -> None:
-        super().__init__()
-        self._pr_num = pr_num
-        self._repo_slug = repo_slug or "?"
-        self._failing = failing
-        self._default_prompt = default_prompt
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="_cc_box"):
-            yield Label(
-                f"Ask Claude  PR #{self._pr_num}  ({self._repo_slug})",
-                id="_cc_title",
-            )
-            if self._failing:
-                shown = self._failing[:6]
-                extra = len(self._failing) - len(shown)
-                lines = "\n".join(f"  ✗ {j}" for j in shown)
-                if extra:
-                    lines += f"\n  … +{extra} more"
-                yield Label(lines, id="_cc_failing")
-            yield Label("Repo path:", classes="cc_lbl")
-            yield Input(
-                value=_DEFAULT_CHECKOUT_PATH,
-                placeholder="Path to repo",
-                id="_cc_path",
-            )
-            yield Label("Initial prompt (editable):", classes="cc_lbl")
-            yield Input(
-                value=self._default_prompt,
-                placeholder="What should Claude do?",
-                id="_cc_prompt",
-            )
-            yield Label("↵ on prompt launches Claude   tab switches fields   esc cancel", id="_cc_hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#_cc_prompt", Input).focus()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "_cc_path":
-            self.query_one("#_cc_prompt", Input).focus()
-            return
-        path = self.query_one("#_cc_path", Input).value.strip()
-        prompt = self.query_one("#_cc_prompt", Input).value.strip()
-        self.dismiss((path or None, prompt or None))
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+from ghstack_tui.modals import AskClaudeModal, CheckoutModal, DiffModal
 
 
 class GhstackTUI(App):
@@ -308,11 +101,11 @@ class GhstackTUI(App):
     _RIGHT_COLS = ("PR", "Title", "Labels", "CI", "💬", "±", "Upd")
     _STACK_COLS = ("Top PR", "#", "Title")
     _CLONES_COLS = ("Path", "Branch", "Repo", "PR", "Subject", "✎")
-    _CLONES_PREFIX = "pytorch"
 
     def __init__(self, query: str | None = None) -> None:
         super().__init__()
-        self.query_str = query or DEFAULT_QUERY
+        self.config = Config.load()
+        self.query_str = query or self.config.default_query or DEFAULT_QUERY
         self.stacks: list[Stack] = []
         self._current_stack_idx = 0
         self._enrich_worker: Worker | None = None
@@ -384,14 +177,15 @@ class GhstackTUI(App):
         status.update(f"Searching: {self.query_str}")
         try:
             self.stacks = load_stacks(self.query_str)
-        except Exception as exc:  # noqa: BLE001
+        except (GhError, json.JSONDecodeError, OSError) as exc:
             status.update(f"Error: {exc}")
+            self.notify(str(exc), title="Load failed", severity="error")
             return
 
         stacks_t: DataTable = self.query_one("#stacks", DataTable)
         stacks_t.clear()
         for s in self.stacks:
-            stacks_t.add_row(*_stack_row(s))
+            stacks_t.add_row(*render_mod.stack_row(s))
 
         if self.stacks:
             status.update(f"{len(self.stacks)} stacks  ({self.query_str})")
@@ -408,7 +202,7 @@ class GhstackTUI(App):
         if not (0 <= idx < len(self.stacks)):
             return
         for c in self.stacks[idx].commits:
-            commits_t.add_row(*_row_for(c))
+            commits_t.add_row(*render_mod.commit_row(c))
         self._kick_row_enrichment(idx)
         # Also kick the detail panel for the (newly-current) row 0.
         if self.stacks[idx].commits:
@@ -433,6 +227,8 @@ class GhstackTUI(App):
         def task() -> None:
             worker = get_current_worker()
             stack = self.stacks[idx]
+            errors = 0
+            last_err = ""
             for row_idx, c in enumerate(stack.commits):
                 if worker.is_cancelled:
                     return
@@ -440,7 +236,9 @@ class GhstackTUI(App):
                     continue
                 try:
                     detail = fetch_pr_details(c.repo_slug, c.pr_num)
-                except Exception:  # noqa: BLE001
+                except (GhError, json.JSONDecodeError, OSError) as exc:
+                    errors += 1
+                    last_err = str(exc)
                     continue
                 for k, v in detail.items():
                     setattr(c, k, v)
@@ -450,6 +248,12 @@ class GhstackTUI(App):
                         c.repo_slug, c.pr_num, c.updated_at, detail
                     )
                 self.call_from_thread(self._update_right_row, idx, row_idx, c)
+            if errors and not worker.is_cancelled:
+                self.call_from_thread(
+                    self.notify,
+                    f"{errors} PR(s) failed to enrich: {last_err}",
+                    severity="warning",
+                )
         return task
 
     def _update_right_row(self, stack_idx: int, row_idx: int, c: Commit) -> None:
@@ -458,7 +262,7 @@ class GhstackTUI(App):
         commits_t: DataTable = self.query_one("#commits", DataTable)
         if row_idx >= commits_t.row_count:
             return
-        for col_idx, val in enumerate(_row_for(c)):
+        for col_idx, val in enumerate(render_mod.commit_row(c)):
             commits_t.update_cell_at((row_idx, col_idx), val, update_width=False)
 
     # --- triage (needs-attention badges across all stacks) ---------------
@@ -511,7 +315,10 @@ class GhstackTUI(App):
                         continue
                     try:
                         detail = fetch_pr_details(c.repo_slug, c.pr_num)
-                    except Exception:  # noqa: BLE001
+                    except (GhError, json.JSONDecodeError, OSError):
+                        # Background pass — don't spam notify; per-stack
+                        # enrichment surfaces errors when the user lands on
+                        # the stack.
                         continue
                     for k, v in detail.items():
                         setattr(c, k, v)
@@ -527,26 +334,20 @@ class GhstackTUI(App):
         # Update the commits table only when this stack is the visible one.
         if s_idx != self._current_stack_idx:
             return
-        try:
-            commits_t = self.query_one("#commits", DataTable)
-        except Exception:
-            return
+        commits_t = self.query_one("#commits", DataTable)
         if r_idx < commits_t.row_count:
-            for col_idx, val in enumerate(_row_for(c)):
+            for col_idx, val in enumerate(render_mod.commit_row(c)):
                 commits_t.update_cell_at(
                     (r_idx, col_idx), val, update_width=False
                 )
 
     def _repaint_current_commits(self) -> None:
-        try:
-            commits_t = self.query_one("#commits", DataTable)
-        except Exception:
-            return
+        commits_t = self.query_one("#commits", DataTable)
         stack = self.stacks[self._current_stack_idx]
         for r_idx, c in enumerate(stack.commits):
             if r_idx >= commits_t.row_count:
                 break
-            for col_idx, val in enumerate(_row_for(c)):
+            for col_idx, val in enumerate(render_mod.commit_row(c)):
                 commits_t.update_cell_at((r_idx, col_idx), val, update_width=False)
 
     # --- background enrichment (detail panel) -----------------------------
@@ -597,10 +398,18 @@ class GhstackTUI(App):
             worker = get_current_worker()
             try:
                 data = fetch_pr_full(repo_slug, pr_num)
-            except Exception as exc:  # noqa: BLE001
+            except (GhError, json.JSONDecodeError, OSError) as exc:
                 if not worker.is_cancelled:
                     self.call_from_thread(self._render_detail_error, str(exc))
                 return
+            if worker.is_cancelled:
+                return
+            try:
+                signal = fetch_merge_signal(repo_slug, pr_num)
+            except (GhError, OSError):
+                signal = None
+            if signal:
+                data["_merge_signal"] = signal
             if worker.is_cancelled:
                 return
             self._detail_cache[(repo_slug, pr_num)] = data
@@ -624,7 +433,7 @@ class GhstackTUI(App):
 
         ci_fail_title = self.query_one("#ci_fail_title")
         ci_failures = self.query_one("#detail_ci_failures", Static)
-        checks = detail_render.get_failing_checks(data)
+        checks_list = detail_render.get_failing_checks(data)
         pr_num = data.get("number")
         commit = self._get_selected_commit()
         repo_slug = commit.repo_slug if commit and commit.pr_num == pr_num else None
@@ -640,9 +449,9 @@ class GhstackTUI(App):
         )
         if drci:
             failures_text = detail_render.render_drci_failures(drci)
-        elif checks and annos:
+        elif checks_list and annos:
             failures_text = detail_render.render_ci_failures_with_annotations(
-                checks, annos
+                checks_list, annos
             )
         else:
             failures_text = detail_render.render_ci_failures(data)
@@ -655,7 +464,10 @@ class GhstackTUI(App):
             ci_failures.display = False
 
     def _render_detail_error(self, msg: str) -> None:
-        self.query_one("#detail_meta", Static).update(Text(f"Detail fetch failed: {msg}", style="red"))
+        self.query_one("#detail_meta", Static).update(
+            Text(f"Detail fetch failed: {msg}", style="red")
+        )
+        self.notify(msg, title="Detail fetch failed", severity="error")
 
     # --- event handlers ---------------------------------------------------
 
@@ -734,10 +546,7 @@ class GhstackTUI(App):
         tabs.active = "tab-clones" if tabs.active == "tab-stacks" else "tab-stacks"
 
     def _active_tab_id(self) -> str:
-        try:
-            return self.query_one("#tabs", TabbedContent).active
-        except Exception:
-            return "tab-stacks"
+        return self.query_one("#tabs", TabbedContent).active
 
     # --- clones tab -------------------------------------------------------
 
@@ -752,7 +561,7 @@ class GhstackTUI(App):
             self._clones_worker.cancel()
         status = self.query_one("#status", Static)
         status.update(
-            f"Scanning {clones_mod.DEFAULT_ROOT}/{self._CLONES_PREFIX}*…"
+            f"Scanning {self.config.clones_root}/{self.config.clones_prefix}*…"
         )
         clones_t = self.query_one("#clones_table", DataTable)
         clones_t.clear()
@@ -768,9 +577,10 @@ class GhstackTUI(App):
             worker = get_current_worker()
             try:
                 results = clones_mod.scan(
-                    clones_mod.DEFAULT_ROOT, name_prefix=self._CLONES_PREFIX
+                    self.config.clones_root_path,
+                    name_prefix=self.config.clones_prefix,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except OSError as exc:
                 if not worker.is_cancelled:
                     self.call_from_thread(self._on_clones_error, str(exc))
                 return
@@ -782,30 +592,22 @@ class GhstackTUI(App):
     def _render_clones(self, results: list[CloneInfo]) -> None:
         self._clones = results
         self._clones_scanned = True
-        try:
-            clones_t = self.query_one("#clones_table", DataTable)
-        except Exception:
-            return  # screen torn down between scan kickoff and render
+        clones_t = self.query_one("#clones_table", DataTable)
         clones_t.clear()
         for c in results:
-            clones_t.add_row(*_clone_row(c))
+            clones_t.add_row(*render_mod.clone_row(c))
         n_repos = sum(1 for c in results if c.is_git)
         n_ghstack = sum(1 for c in results if c.is_ghstack)
-        try:
-            self.query_one("#status", Static).update(
-                f"{n_ghstack} ghstack / {n_repos} repos under "
-                f"{clones_mod.DEFAULT_ROOT}/{self._CLONES_PREFIX}*"
-            )
-        except Exception:
-            pass
+        self.query_one("#status", Static).update(
+            f"{n_ghstack} ghstack / {n_repos} repos under "
+            f"{self.config.clones_root}/{self.config.clones_prefix}*"
+        )
 
     def _on_clones_error(self, msg: str) -> None:
-        try:
-            self.query_one("#status", Static).update(
-                Text(f"Clone scan failed: {msg}", style="red")
-            )
-        except Exception:
-            pass
+        self.query_one("#status", Static).update(
+            Text(f"Clone scan failed: {msg}", style="red")
+        )
+        self.notify(msg, title="Clone scan failed", severity="error")
 
     def _jump_to_pr(self, pr_num: int) -> bool:
         """Switch to Stacks tab and select the stack containing pr_num. Returns True if found."""
@@ -848,7 +650,13 @@ class GhstackTUI(App):
                 f"Use get_pr_info and get_pr_diff to understand the changes."
             )
         self.push_screen(
-            _AskClaudeModal(commit.pr_num, commit.repo_slug, failing, default_prompt),
+            AskClaudeModal(
+                commit.pr_num,
+                commit.repo_slug,
+                failing,
+                default_prompt,
+                self.config.checkout_path,
+            ),
             self._on_claude_modal_result,
         )
 
@@ -878,7 +686,7 @@ class GhstackTUI(App):
             subprocess.run(cmd, cwd=expanded)
 
     def _write_mcp_config(self, repo_path: str, commit: Commit) -> str:
-        """Write MCP config to ~/.config/ghstack-tui/ and return its path."""
+        """Write MCP config under the ghstack-tui root and return its path."""
         stack = self.stacks[self._current_stack_idx] if self.stacks else None
         stack_prs = [str(c.pr_num) for c in stack.commits if c.pr_num] if stack else []
 
@@ -898,10 +706,8 @@ class GhstackTUI(App):
             }
         }
 
-        config_dir = Path.home() / ".config" / "ghstack-tui"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        # Use repo path hash so different repos get distinct configs
-        import hashlib
+        config_dir = paths.ensure_root()
+        # One config per repo path so different checkouts don't clobber each other.
         repo_hash = hashlib.sha1(repo_path.encode()).hexdigest()[:8]
         mcp_json = config_dir / f"{repo_hash}.mcp.json"
         mcp_json.write_text(json.dumps(config, indent=2))
@@ -913,7 +719,7 @@ class GhstackTUI(App):
             self.notify("No PR selected", severity="warning")
             return
         self.push_screen(
-            CheckoutModal(commit.pr_num, commit.repo_slug),
+            CheckoutModal(commit.pr_num, commit.repo_slug, self.config.checkout_path),
             self._on_checkout_path,
         )
 
@@ -949,7 +755,7 @@ class GhstackTUI(App):
                     self.notify, "ghstack not found in PATH", severity="error"
                 )
                 return
-            except Exception as exc:  # noqa: BLE001
+            except (OSError, subprocess.SubprocessError) as exc:
                 self.call_from_thread(self.notify, str(exc), severity="error")
                 return
             if result.returncode == 0:
@@ -1016,7 +822,7 @@ class GhstackTUI(App):
                     self._drci_failures[key] = fetch_drci_failures(
                         repo_slug, pr_num
                     )
-                except Exception:  # noqa: BLE001
+                except (GhError, OSError):
                     self._drci_failures[key] = {}
             if worker.is_cancelled:
                 return
@@ -1036,7 +842,7 @@ class GhstackTUI(App):
                     continue
                 try:
                     raw = fetch_check_annotations(repo_slug, cid)
-                except Exception:  # noqa: BLE001
+                except (GhError, OSError):
                     raw = []
                 # Keep only real failures — drop workflow warnings/notices
                 # (e.g. "Node.js 20 actions are deprecated").
@@ -1049,7 +855,7 @@ class GhstackTUI(App):
                     # instead of emitting them as annotations.
                     try:
                         tests = fetch_failed_tests(repo_slug, cid)
-                    except Exception:  # noqa: BLE001
+                    except (GhError, OSError):
                         tests = []
                     annos = [
                         {
@@ -1136,148 +942,16 @@ class GhstackTUI(App):
         return None
 
 
-# --- row rendering --------------------------------------------------------
+# --- back-compat re-exports (tests reach in for these names) -----------
 
-
-def _clone_row(c: CloneInfo) -> tuple:
-    path_txt = Text(c.path.name)
-    if not c.is_git:
-        path_txt.stylize("dim")
-    branch_txt = Text(c.branch) if c.branch else Text(f"({c.head_short})", style="dim")
-    repo_txt = Text(c.repo_slug or "—", style="" if c.repo_slug else "dim")
-    pr_txt = Text(f"#{c.pr_num}" if c.pr_num is not None else "—",
-                  style="" if c.pr_num is not None else "dim")
-    if c.is_ghstack:
-        pr_txt.stylize("cyan")
-    subject = c.error or c.subject
-    dirty = Text("●", style="yellow") if c.dirty else Text("")
-    return (
-        path_txt,
-        branch_txt,
-        repo_txt,
-        pr_txt,
-        _truncate(subject, 60),
-        dirty,
-    )
-
-
-def _row_for(c: Commit) -> tuple:
-    pr = Text(f"#{c.pr_num}" if c.pr_num is not None else "—")
-    if c.is_draft:
-        pr.stylize("yellow")
-    title = _truncate(c.subject, 50)
-    return (
-        pr,
-        title,
-        _labels_pretty(c.labels),
-        _ci_pretty(c),
-        str(c.comments_count) if c.comments_count else "",
-        _diff_pretty(c),
-        _rel_time(c.updated_at),
-    )
-
-
-def _stack_row(s: Stack) -> tuple:
-    return (
-        f"#{s.top_pr}" if s.top_pr is not None else "—",
-        str(len(s.commits)),
-        _truncate(s.title, 80),
-    )
-
-
-_LABEL_PRIORITY_PREFIXES = ("ciflow/", "release/", "topic:", "module:")
-
-
-def _labels_pretty(labels: list[str]) -> Text:
-    if not labels:
-        return Text("")
-    chosen: list[str] = []
-    for prio in _LABEL_PRIORITY_PREFIXES:
-        for lbl in labels:
-            if lbl.startswith(prio) and lbl not in chosen:
-                chosen.append(_short_label(lbl))
-                break
-        if len(chosen) >= 2:
-            break
-    for lbl in labels:
-        if len(chosen) >= 2:
-            break
-        sl = _short_label(lbl)
-        if sl not in chosen:
-            chosen.append(sl)
-    return Text(", ".join(chosen))
-
-
-def _short_label(lbl: str) -> str:
-    for pfx in ("module: ", "topic: ", "ciflow/"):
-        if lbl.startswith(pfx):
-            return lbl[len(pfx):]
-    return lbl
-
-
-def _ci_pretty(c: Commit) -> Text:
-    if not c.enriched:
-        return Text("…", style="dim")
-    if c.ci_ok == c.ci_fail == c.ci_pending == 0:
-        return Text("—", style="dim")
-    t = Text()
-    if c.ci_ok:
-        t.append(f"✓{c.ci_ok} ", style="green")
-    if c.ci_fail:
-        t.append(f"✗{c.ci_fail} ", style="red")
-    if c.ci_pending:
-        t.append(f"●{c.ci_pending}", style="yellow")
-    return t
-
-
-def _diff_pretty(c: Commit) -> Text:
-    if c.additions is None or c.deletions is None:
-        return Text("…", style="dim")
-    t = Text()
-    t.append(f"+{c.additions}", style="green")
-    t.append(" ")
-    t.append(f"-{c.deletions}", style="red")
-    return t
-
-
-def _rel_time(iso: str) -> str:
-    if not iso:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    delta = datetime.now(timezone.utc) - dt
-    s = int(delta.total_seconds())
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        return f"{s // 3600}h"
-    return f"{s // 86400}d"
-
-
-def _truncate(s: str, n: int) -> str:
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
-def _render_diff(raw: str) -> Text:
-    """Colorize a unified diff string into a Rich Text object."""
-    t = Text(no_wrap=True)
-    for line in raw.splitlines():
-        if line.startswith("diff ") or line.startswith("index "):
-            t.append(line + "\n", style="bold yellow")
-        elif line.startswith("--- ") or line.startswith("+++ "):
-            t.append(line + "\n", style="bold")
-        elif line.startswith("+"):
-            t.append(line + "\n", style="green")
-        elif line.startswith("-"):
-            t.append(line + "\n", style="red")
-        elif line.startswith("@@"):
-            t.append(line + "\n", style="cyan")
-        elif line.startswith("\\"):
-            t.append(line + "\n", style="dim")
-        else:
-            t.append(line + "\n")
-    return t
+_DEFAULT_CHECKOUT_PATH = "~/git/pytorch313"
+_row_for = render_mod.commit_row
+_stack_row = render_mod.stack_row
+_clone_row = render_mod.clone_row
+_labels_pretty = render_mod.labels_pretty
+_short_label = render_mod.short_label
+_ci_pretty = render_mod.ci_pretty
+_diff_pretty = render_mod.diff_pretty
+_rel_time = render_mod.rel_time
+_truncate = render_mod.truncate
+_render_diff = render_mod.render_diff

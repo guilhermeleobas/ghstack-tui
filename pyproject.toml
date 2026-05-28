@@ -6,7 +6,10 @@ build-backend = "hatchling.build"
 name = "ghstack_tui"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["textual>=0.79"]
+dependencies = ["textual>=5.0"]
+
+[project.scripts]
+ghstack-tui = "ghstack_tui.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ghstack_tui"]

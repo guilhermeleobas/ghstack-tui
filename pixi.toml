@@ -12,7 +12,7 @@ python = ">=3.11,<3.13"
 pip = "*"
 
 [pypi-dependencies]
-textual = ">=0.79"
+textual = ">=5.0"
 ghstack_tui = { path = ".", editable = true }
 pytest = ">=8"
 pytest-asyncio = ">=0.23"
