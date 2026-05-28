@@ -11,6 +11,17 @@ _FAIL_CONCLUSIONS = {
     "ACTION_REQUIRED", "STARTUP_FAILURE",
 }
 
+_MERGE_STATE_STYLE = {
+    "CLEAN": "bold green",
+    "BEHIND": "bold yellow",
+    "BLOCKED": "bold red",
+    "DIRTY": "bold red",
+    "DRAFT": "bold yellow",
+    "HAS_HOOKS": "bold yellow",
+    "UNSTABLE": "bold yellow",
+    "UNKNOWN": "dim",
+}
+
 # Actions detailsUrl looks like:
 #   https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>
 # The job_id is also the check-run id for the annotations API.
@@ -167,7 +178,7 @@ def render_ci_failures_with_annotations(
 
 
 def render_header(data: dict) -> Text:
-    """Top line of the detail panel: PR number, title, state, draft, author, mergeable."""
+    """Top line of the detail panel: PR number, title, state, draft, author, merge state."""
     state = (data.get("state") or "").upper()
     is_draft = data.get("isDraft", False)
 
@@ -200,6 +211,22 @@ def render_header(data: dict) -> Text:
     mergeable = (data.get("mergeable") or "").upper()
     if mergeable == "CONFLICTING":
         t.append("  conflicts", style="bold red")
+    elif state == "OPEN":
+        if data.get("isInMergeQueue") or data.get("autoMergeRequest"):
+            t.append("  queued", style="bold cyan")
+        else:
+            merge_state = (data.get("mergeStateStatus") or "").upper()
+            if merge_state:
+                label = "mergeable" if merge_state == "CLEAN" else merge_state.replace("_", " ").lower()
+                t.append(f"  {label}", style=_MERGE_STATE_STYLE.get(merge_state, "dim"))
+            elif mergeable == "MERGEABLE":
+                t.append("  mergeable", style="bold green")
+            elif mergeable == "UNKNOWN":
+                t.append("  unknown", style="dim")
+
+    signal = data.get("_merge_signal")
+    if signal and signal.get("label"):
+        t.append(f"  {signal['label']}", style=signal.get("style") or "bold cyan")
 
     return t
 

@@ -71,7 +71,8 @@ def get_pr_info(pr: int = 0, repo: str = "") -> str:
             "--repo", repo,
             "--json",
             "number,title,body,state,isDraft,additions,deletions,"
-            "changedFiles,reviewDecision,baseRefName,headRefName,author",
+            "changedFiles,reviewDecision,baseRefName,headRefName,author,"
+            "mergeable,mergeStateStatus,isInMergeQueue",
         ],
         capture_output=True, text=True, check=True,
     )
