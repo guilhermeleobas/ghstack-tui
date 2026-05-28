@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -21,18 +23,73 @@ from ghstack_tui.render import render_diff
 _DEFAULT_CHECKOUT_PATH = "~/git/pytorch313"
 
 
-def _render_diff_output(raw: str):
+def _parse_diff_files(raw: str) -> list[tuple[str, str, str]]:
+    """Split unified diff into (old_content, new_content, display_name) per file."""
+    result = []
+    old_lines: list[str] = []
+    new_lines: list[str] = []
+    display = ""
+    in_hunk = False
+
+    for line in raw.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if display:
+                result.append(("".join(old_lines), "".join(new_lines), display))
+            old_lines, new_lines, display, in_hunk = [], [], "", False
+        elif line.startswith("--- "):
+            path = line[4:].rstrip()
+            if path.startswith("a/"):
+                path = path[2:]
+            if path != "/dev/null":
+                display = display or path
+        elif line.startswith("+++ "):
+            path = line[4:].rstrip()
+            if path.startswith("b/"):
+                path = path[2:]
+            if path != "/dev/null":
+                display = path
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk:
+            if line.startswith("-"):
+                old_lines.append(line[1:])
+            elif line.startswith("+"):
+                new_lines.append(line[1:])
+            elif line.startswith(" "):
+                old_lines.append(line[1:])
+                new_lines.append(line[1:])
+            elif not line.startswith("\\"):
+                in_hunk = False
+
+    if display:
+        result.append(("".join(old_lines), "".join(new_lines), display))
+    return result
+
+
+def _render_diff_output(raw: str) -> tuple[Text, str]:
     if shutil.which("difft"):
         try:
-            proc = subprocess.run(
-                ["difft", "--color", "always"],
-                input=raw,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                return Text.from_ansi(proc.stdout), "difftastic"
-        except OSError:
+            parts = _parse_diff_files(raw)
+            if parts:
+                chunks: list[str] = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for old_content, new_content, name in parts:
+                        suffix = Path(name).suffix or ".txt"
+                        old_f = Path(tmpdir) / f"old{suffix}"
+                        new_f = Path(tmpdir) / f"new{suffix}"
+                        old_f.write_text(old_content)
+                        new_f.write_text(new_content)
+                        proc = subprocess.run(
+                            ["difft", "--color", "always", str(old_f), str(new_f)],
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if proc.stdout:
+                            chunks.append(proc.stdout)
+                if chunks:
+                    return Text.from_ansi("\n".join(chunks)), "difftastic"
+        except (OSError, subprocess.TimeoutExpired):
             pass
     return render_diff(raw), "unified"
 
