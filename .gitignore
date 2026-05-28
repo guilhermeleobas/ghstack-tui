@@ -9,3 +9,35 @@ __pycache__/
 dist/
 build/
 .venv/
+*.pyo
+*.pyd
+.Python
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Type checkers
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Packaging
+*.whl
+*.tar.gz
+MANIFEST
+
+# Jupyter
+.ipynb_checkpoints/
