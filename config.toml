@@ -1,7 +1,7 @@
 # Copy to ~/.config/ghstack-tui/config.toml or point GHSTACK_TUI_CONFIG at it.
 
 [paths]
-default_checkout_path = "~/git/pytorch313"
+default_checkout_path = "~/git/pytorch"
 clones_root = "~/git"
 triage_cache_path = "~/.config/ghstack-tui/triage-cache.json"
 mcp_config_dir = "~/.config/ghstack-tui"

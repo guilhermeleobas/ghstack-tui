@@ -405,7 +405,6 @@ class GhstackTUI(App):
         Binding("ctrl+w", "close_pi", "Close Pi"),
         Binding("f", "show_failing_tests", "Failing tests"),
         Binding("d", "diff", "Diff"),
-        Binding("v", "view_in_editor", "View diff"),
         Binding("o", "open_in_browser", "Open PR"),
         Binding("/", "focus_query", "Edit query"),
         Binding("t", "toggle_tab", "Tab", priority=True),
@@ -1303,24 +1302,6 @@ class GhstackTUI(App):
             DiffModal(commit.pr_num, commit.repo_slug, commit.subject)
         )
 
-    def action_view_in_editor(self) -> None:
-        commit = self._get_selected_commit()
-        if commit is None or commit.pr_num is None or commit.repo_slug is None:
-            self.notify("No PR selected", severity="warning")
-            return
-        diff_cmd = (
-            f"gh pr diff {commit.pr_num} --repo {shlex.quote(commit.repo_slug)}"
-        )
-        if shutil.which("delta"):
-            cmd = f"{diff_cmd} | delta"
-        elif shutil.which("nvim"):
-            cmd = f"{diff_cmd} | nvim -c 'set ft=diff' -"
-        elif shutil.which("vim"):
-            cmd = f"{diff_cmd} | vim -c 'set ft=diff' -"
-        else:
-            cmd = f"{diff_cmd} | less -R"
-        with self.suspend():
-            subprocess.run(["bash", "-c", cmd], check=False)
 
     def _get_selected_commit(self) -> "Commit | None":
         if not self.stacks:

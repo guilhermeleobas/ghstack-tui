@@ -12,6 +12,7 @@ update = "git pull origin main"
 python = ">=3.11,<3.13"
 pip = "*"
 difftastic = "*"
+nodejs = "*"
 
 [pypi-dependencies]
 textual = ">=5.0"
@@ -22,3 +23,6 @@ mcp = ">=1.0"
 
 [tasks.test]
 cmd = "pytest tests/ -v"
+
+[tasks.install-agents]
+cmd = "npm install -g @earendil-works/pi-coding-agent @anthropic-ai/claude-code"
