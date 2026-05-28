@@ -23,12 +23,14 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from ghstack_tui.config import get_config
 from ghstack_tui.models import Commit, Stack
 
 _STACK_HEADER_RE = re.compile(r"Stack from \[ghstack\]\([^)]*\)[^:\n]*:", re.IGNORECASE)
 _STACK_PR_RE = re.compile(r"^\s*\*\s+(?:__->__\s+)?#(\d+)\s*$", re.MULTILINE)
 
-DEFAULT_QUERY = "is:pr is:open author:@me"
+DEFAULT_QUERY = get_config().search.default_query
+DEFAULT_SEARCH_LIMIT = get_config().search.gh_search_limit
 
 
 # --- subprocess wrapper ----------------------------------------------------
@@ -465,7 +467,7 @@ def _build_stacks(prs: list[_PR]) -> list[Stack]:
     return stacks
 
 
-def load_stacks(query: str = DEFAULT_QUERY, limit: int = 200) -> list[Stack]:
+def load_stacks(query: str = DEFAULT_QUERY, limit: int = DEFAULT_SEARCH_LIMIT) -> list[Stack]:
     raw = _run_gh_search(query, limit)
     prs = [p for p in (_classify(item) for item in raw) if p is not None]
     return _build_stacks(prs)

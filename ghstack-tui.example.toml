@@ -1,0 +1,26 @@
+# Copy to ~/.config/ghstack-tui/config.toml or point GHSTACK_TUI_CONFIG at it.
+
+[paths]
+default_checkout_path = "~/git/pytorch313"
+clones_root = "~/git"
+triage_cache_path = "~/.config/ghstack-tui/triage-cache.json"
+mcp_config_dir = "~/.config/ghstack-tui"
+
+[search]
+default_query = "is:pr is:open author:@me"
+clones_prefix = "pytorch"
+gh_search_limit = 200
+
+[agents]
+claude_command = "claude"
+pi_command = "pi"
+
+[prompts]
+claude_fix_ci_template = "Fix the CI failures on PR #{pr_num}. Failing jobs: {shown}{suffix}. Use get_failing_jobs to list all failures, get_pr_diff to understand the changes, then fix the issues."
+claude_review_template = "Review PR #{pr_num}. Use get_pr_info and get_pr_diff to understand the changes."
+pi_intro = "You are helping with a ghstack PR from ghstack-tui."
+pi_checkout_instruction = "Use the local checkout in the current working directory when possible."
+pi_gh_instruction_template = "Use gh for GitHub context when needed, e.g. `gh pr view {pr_num} --repo {repo_slug}` and `gh pr diff {pr_num} --repo {repo_slug}`."
+pi_validation_instruction = "If you make code changes, explain them briefly and run targeted validation commands."
+pi_initial_task = "Fix the issue or explain the next best step."
+pi_fallback_task = "Review the PR and suggest next steps."

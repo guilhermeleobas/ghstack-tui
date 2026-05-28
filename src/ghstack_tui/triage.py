@@ -5,7 +5,7 @@ for the commits table. Caching keys on `updatedAt`: GitHub bumps it on any PR
 activity (commit push, comment, review, CI rerun), so a cache hit means
 nothing has changed and the stored verdict is still valid.
 
-Cache file: ~/.config/ghstack-tui/triage-cache.json (override with GHSTACK_TUI_ROOT).
+Cache file: ~/.config/ghstack-tui/triage-cache.json
 """
 
 from __future__ import annotations
@@ -16,11 +16,13 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ghstack_tui import paths
+from ghstack_tui.config import get_config
 
 if TYPE_CHECKING:
     from ghstack_tui.models import Commit
 
+
+CACHE_PATH = Path(get_config().paths.triage_cache_path).expanduser()
 
 # Verdict severity ordering. Higher index = more urgent.
 _SEVERITY = {"ok": 0, "draft": 1, "waiting": 2, "ready": 3, "attention": 4}
@@ -53,7 +55,6 @@ def verdict_for(c: "Commit") -> tuple[str, str]:
     if c.ci_pending > 0:
         return "waiting", "CI pending"
     if c.review_decision in ("REVIEW_REQUIRED", ""):
-        # Empty review_decision after enrichment = no review required yet.
         if c.review_decision == "REVIEW_REQUIRED":
             return "waiting", "awaiting review"
     return "ok", ""
@@ -70,20 +71,11 @@ def worst(verdicts: list[str]) -> str:
     return max(verdicts, key=lambda v: _SEVERITY.get(v, 0))
 
 
-# --- cache ---------------------------------------------------------------
-
-# Cache layout (JSON):
-#   { "owner/repo#1234": { "updated_at": "2026-...", "data": { <enrichment dict> } } }
-#
-# `data` is the dict returned by gh_client.fetch_pr_details so we can rehydrate
-# the Commit without re-running `gh pr view`.
-
-
 class TriageCache:
     """Thread-safe JSON cache for PR enrichment data, keyed by (repo, pr, updatedAt)."""
 
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path if path is not None else paths.cache_path()
+        self._path = path if path is not None else CACHE_PATH
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
         self._load()
@@ -99,15 +91,13 @@ class TriageCache:
             self._data = {}
 
     def _save_locked(self) -> None:
-        # Atomic write: tmp + os.replace. A SIGKILL or full disk mid-write
-        # leaves the original cache intact; partial JSON would corrupt it.
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(self._path.suffix + ".tmp")
             tmp.write_text(json.dumps(self._data, indent=2))
             os.replace(tmp, self._path)
         except OSError:
-            pass  # cache is best-effort
+            pass
 
     def get(self, repo_slug: str, pr_num: int, updated_at: str) -> dict | None:
         if not updated_at:

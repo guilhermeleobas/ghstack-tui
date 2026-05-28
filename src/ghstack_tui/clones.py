@@ -14,6 +14,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from ghstack_tui.config import get_config
+
 
 _PR_URL_RE = re.compile(
     r"Pull Request resolved:\s*https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)",
@@ -23,7 +25,7 @@ _GHSTACK_ID_RE = re.compile(
     r"^ghstack-source-id:\s*(\S+)", re.MULTILINE | re.IGNORECASE
 )
 
-DEFAULT_ROOT = Path("~/git")
+DEFAULT_ROOT = Path(get_config().paths.clones_root)
 
 
 @dataclass

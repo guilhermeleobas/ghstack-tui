@@ -12,11 +12,13 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
     Input,
+    Label,
     Markdown,
     Static,
     TabbedContent,
@@ -26,11 +28,10 @@ from textual.worker import Worker, get_current_worker
 
 from ghstack_tui import clones as clones_mod
 from ghstack_tui import detail as detail_render
-from ghstack_tui import paths
 from ghstack_tui import render as render_mod
 from ghstack_tui import triage as triage_mod
 from ghstack_tui.clones import CloneInfo
-from ghstack_tui.config import Config
+from ghstack_tui.config import get_config
 from ghstack_tui.detail import get_failing_jobs
 from ghstack_tui.gh_client import (
     DEFAULT_QUERY,
@@ -40,12 +41,322 @@ from ghstack_tui.gh_client import (
     fetch_failed_tests,
     fetch_merge_signal,
     fetch_pr_details,
-    fetch_pr_diff,
     fetch_pr_full,
     load_stacks,
 )
 from ghstack_tui.models import Commit, Stack
 from ghstack_tui.modals import AskClaudeModal, CheckoutModal, DiffModal
+from ghstack_tui.pi_rpc import PiRpcSession, build_pi_prompt
+
+
+_APP_CONFIG = get_config()
+_DEFAULT_CHECKOUT_PATH = _APP_CONFIG.paths.default_checkout_path
+
+
+class _AskAgentModal(ModalScreen):
+    """Floating dialog: show failing CI context, pick repo path + initial prompt."""
+
+    DEFAULT_CSS = """
+    _AskAgentModal { align: center middle; }
+    #_cc_box {
+        width: 80;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #_cc_title   { text-style: bold; margin-bottom: 1; }
+    #_cc_failing { color: $error; margin-bottom: 1; }
+    .cc_lbl      { color: $text-muted; margin-top: 1; }
+    #_cc_hint    { color: $text-muted; margin-top: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(
+        self,
+        agent_name: str,
+        pr_num: int | None,
+        repo_slug: str | None,
+        failing: list[str],
+        default_prompt: str = "",
+    ) -> None:
+        super().__init__()
+        self._agent_name = agent_name
+        self._pr_num = pr_num
+        self._repo_slug = repo_slug or "?"
+        self._failing = failing
+        self._default_prompt = default_prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="_cc_box"):
+            yield Label(
+                f"Ask {self._agent_name}  PR #{self._pr_num}  ({self._repo_slug})",
+                id="_cc_title",
+            )
+            if self._failing:
+                shown = self._failing[:6]
+                extra = len(self._failing) - len(shown)
+                lines = "\n".join(f"  ✗ {j}" for j in shown)
+                if extra:
+                    lines += f"\n  … +{extra} more"
+                yield Label(lines, id="_cc_failing")
+            yield Label("Repo path:", classes="cc_lbl")
+            yield Input(
+                value=_DEFAULT_CHECKOUT_PATH,
+                placeholder="Path to repo",
+                id="_cc_path",
+            )
+            yield Label("Initial prompt (editable):", classes="cc_lbl")
+            yield Input(
+                value=self._default_prompt,
+                placeholder=f"What should {self._agent_name} do?",
+                id="_cc_prompt",
+            )
+            yield Label(
+                f"↵ on prompt launches {self._agent_name}   tab switches fields   esc cancel",
+                id="_cc_hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#_cc_prompt", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "_cc_path":
+            self.query_one("#_cc_prompt", Input).focus()
+            return
+        path = self.query_one("#_cc_path", Input).value.strip()
+        prompt = self.query_one("#_cc_prompt", Input).value.strip()
+        self.dismiss((path or None, prompt or None))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PiChatPane(Vertical):
+    """Docked Pi RPC chat pane bound to a local repo checkout."""
+
+    DEFAULT_CSS = """
+    PiChatPane {
+        width: 42%;
+        min-width: 48;
+        height: 1fr;
+        border: solid $accent;
+        display: none;
+    }
+    #_pi_header {
+        height: 3;
+        padding: 0 1;
+        background: $panel;
+    }
+    #_pi_title { text-style: bold; }
+    #_pi_status { color: $text-muted; }
+    #_pi_scroll { height: 1fr; }
+    #_pi_transcript { padding: 0 1; }
+    #_pi_hint {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    #_pi_input {
+        dock: bottom;
+        border-top: solid $accent;
+    }
+    """
+
+    def __init__(self, *children, **kwargs) -> None:
+        super().__init__(*children, **kwargs)
+        self._repo_path = ""
+        self._rpc: PiRpcSession | None = None
+        self._ready = False
+        self._initial_prompt_sent = False
+        self._assistant_prefix_rendered = False
+        self._transcript = Text()
+        self._session_id = 0
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="_pi_header"):
+            yield Label("Pi", id="_pi_title")
+            yield Label("Idle", id="_pi_status")
+        with VerticalScroll(id="_pi_scroll"):
+            yield Static("", id="_pi_transcript")
+        yield Label("Enter sends • use Ctrl+W to close Pi", id="_pi_hint")
+        yield Input(placeholder="Message Pi…", id="_pi_input")
+
+    def on_mount(self) -> None:
+        self.display = False
+
+    def on_unmount(self) -> None:
+        self.close_session()
+
+    def open_session(self, repo_path: str, title: str, initial_prompt: str) -> None:
+        self.close_session()
+        self._session_id += 1
+        self._repo_path = str(Path(repo_path).expanduser())
+        self._ready = False
+        self._initial_prompt_sent = False
+        self._assistant_prefix_rendered = False
+        self._transcript = Text()
+        self.display = True
+        self.query_one("#_pi_title", Label).update(title)
+        self.query_one("#_pi_status", Label).update(Text("Starting Pi…", style="dim"))
+        input_widget = self.query_one("#_pi_input", Input)
+        input_widget.disabled = False
+        input_widget.value = ""
+        self._refresh_transcript()
+        self._append_line(f"Pi RPC session in {self._repo_path}", style="dim")
+        self.run_worker(
+            self._run_pi(self._session_id, initial_prompt),
+            thread=True,
+            name=f"pi-rpc-{self._session_id}",
+        )
+        input_widget.focus()
+
+    def close_session(self) -> None:
+        self._session_id += 1
+        if self._rpc is not None:
+            self._rpc.close()
+            self._rpc = None
+        self._ready = False
+        self.display = False
+
+    def focus_input(self) -> None:
+        if self.display:
+            self.query_one("#_pi_input", Input).focus()
+
+    def abort(self) -> None:
+        if self._rpc is None or not self._rpc.is_streaming:
+            self.app.notify("Pi is idle", severity="information")
+            return
+        self._rpc.abort()
+        self._set_status("Aborting Pi…")
+
+    def _run_pi(self, session_id: int, initial_prompt: str):
+        def task() -> None:
+            rpc = PiRpcSession(
+                self._repo_path,
+                lambda event: self.app.call_from_thread(
+                    self._on_rpc_event, session_id, initial_prompt, event
+                ),
+            )
+            self._rpc = rpc
+            rpc.run()
+        return task
+
+    def _refresh_transcript(self) -> None:
+        self.query_one("#_pi_transcript", Static).update(self._transcript)
+        self.query_one("#_pi_scroll", VerticalScroll).scroll_end(animate=False)
+
+    def _append_line(self, text: str, *, style: str = "") -> None:
+        if self._transcript.plain:
+            self._transcript.append("\n")
+        self._transcript.append(text, style=style)
+        self._refresh_transcript()
+
+    def _append_block(self, speaker: str, text: str, *, style: str = "") -> None:
+        if self._transcript.plain:
+            self._transcript.append("\n\n")
+        self._transcript.append(
+            f"{speaker}> ", style="bold cyan" if speaker == "You" else "bold green"
+        )
+        self._transcript.append(text, style=style)
+        self._refresh_transcript()
+
+    def _ensure_assistant_prefix(self) -> None:
+        if self._assistant_prefix_rendered:
+            return
+        if self._transcript.plain:
+            self._transcript.append("\n\n")
+        self._transcript.append("Pi> ", style="bold green")
+        self._assistant_prefix_rendered = True
+
+    def _set_status(self, text: str) -> None:
+        self.query_one("#_pi_status", Label).update(Text(text, style="dim"))
+
+    def _extract_assistant_text(self, message: dict) -> str:
+        parts: list[str] = []
+        for item in message.get("content") or []:
+            if item.get("type") == "text" and item.get("text"):
+                parts.append(item["text"])
+        return "".join(parts).strip()
+
+    def _send_prompt(self, text: str) -> None:
+        if not text.strip():
+            return
+        if not self._ready or self._rpc is None:
+            self.app.notify("Pi is not ready yet", severity="warning")
+            return
+        self._append_block("You", text)
+        self._rpc.prompt(text)
+        queued = "Queued follow-up for Pi…" if self._rpc.is_streaming else "Sent to Pi…"
+        self._set_status(queued)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "_pi_input":
+            return
+        text = event.value.strip()
+        event.input.value = ""
+        self._send_prompt(text)
+
+    def _on_rpc_event(self, session_id: int, initial_prompt: str, event: dict) -> None:
+        if session_id != self._session_id:
+            return
+        etype = event.get("type")
+        if etype == "rpc_ready":
+            self._ready = True
+            self._set_status("Pi ready")
+            if initial_prompt and not self._initial_prompt_sent:
+                self._initial_prompt_sent = True
+                self._send_prompt(initial_prompt)
+            return
+        if etype == "rpc_error":
+            self._append_line(
+                f"Pi RPC error: {event.get('error', 'unknown error')}", style="bold red"
+            )
+            self._set_status("Pi error")
+            return
+        if etype == "rpc_exit":
+            returncode = event.get("returncode")
+            stderr = event.get("stderr")
+            self._set_status(f"Pi exited ({returncode})")
+            self.query_one("#_pi_input", Input).disabled = True
+            if stderr:
+                self._append_line(stderr, style="red")
+            return
+        if etype == "response":
+            if not event.get("success", False):
+                self._append_line(
+                    f"RPC {event.get('command') or 'command'} failed: {event.get('error') or 'unknown error'}",
+                    style="bold red",
+                )
+                self._set_status("Pi error")
+            return
+        if etype == "agent_start":
+            self._assistant_prefix_rendered = False
+            self._set_status("Pi working…")
+            return
+        if etype == "agent_end":
+            self._assistant_prefix_rendered = False
+            self._set_status("Pi idle")
+            return
+        if etype == "tool_execution_start":
+            self._set_status(f"Pi running {event.get('toolName', 'tool')}…")
+            return
+        if etype == "message_update":
+            delta = event.get("assistantMessageEvent") or {}
+            if delta.get("type") == "text_delta":
+                self._ensure_assistant_prefix()
+                self._transcript.append(delta.get("delta") or "")
+                self._refresh_transcript()
+            return
+        if etype == "message_end":
+            message = event.get("message") or {}
+            if message.get("role") != "assistant":
+                return
+            if not self._assistant_prefix_rendered:
+                text = self._extract_assistant_text(message)
+                if text:
+                    self._append_block("Pi", text)
 
 
 class GhstackTUI(App):
@@ -63,7 +374,8 @@ class GhstackTUI(App):
     CSS = """
     TabbedContent { height: 1fr; }
     #query { dock: top; height: 3; border: solid $accent; }
-    #main { height: 1fr; }
+    #workspace { height: 1fr; }
+    #main { height: 1fr; width: 1fr; }
     #stacks  { width: 30%; border: solid $accent; }
     #right_col { width: 70%; }
     #commits { height: 40%; border: solid $accent; }
@@ -89,6 +401,8 @@ class GhstackTUI(App):
         Binding("r", "reload", "Reload"),
         Binding("c", "checkout", "Checkout"),
         Binding("a", "ask_claude", "Ask Claude"),
+        Binding("p", "ask_pi", "Ask Pi"),
+        Binding("ctrl+w", "close_pi", "Close Pi"),
         Binding("f", "show_failing_tests", "Failing tests"),
         Binding("d", "diff", "Diff"),
         Binding("v", "view_in_editor", "View diff"),
@@ -104,8 +418,8 @@ class GhstackTUI(App):
 
     def __init__(self, query: str | None = None) -> None:
         super().__init__()
-        self.config = Config.load()
-        self.query_str = query or self.config.default_query or DEFAULT_QUERY
+        self._config = _APP_CONFIG
+        self.query_str = query or self._config.search.default_query or DEFAULT_QUERY
         self.stacks: list[Stack] = []
         self._current_stack_idx = 0
         self._enrich_worker: Worker | None = None
@@ -131,23 +445,25 @@ class GhstackTUI(App):
                     placeholder="GitHub PR search query",
                     id="query",
                 )
-                with Horizontal(id="main"):
-                    yield DataTable(id="stacks", cursor_type="row", zebra_stripes=True)
-                    with Vertical(id="right_col"):
-                        yield DataTable(id="commits", cursor_type="row", zebra_stripes=True)
-                        with VerticalScroll(id="detail"):
-                            yield Static("", id="detail_header")
-                            yield Static("", id="detail_meta")
-                            yield Static("Failing CI", classes="section_title", id="ci_fail_title")
-                            yield Static("", id="detail_ci_failures")
-                            yield Static("Body", classes="section_title")
-                            yield Markdown("", id="detail_body")
-                            yield Static("Checks", classes="section_title")
-                            yield Static("", id="detail_checks")
-                            yield Static("Reviewers", classes="section_title")
-                            yield Static("", id="detail_reviewers")
-                            yield Static("Files", classes="section_title")
-                            yield Static("", id="detail_files")
+                with Horizontal(id="workspace"):
+                    with Horizontal(id="main"):
+                        yield DataTable(id="stacks", cursor_type="row", zebra_stripes=True)
+                        with Vertical(id="right_col"):
+                            yield DataTable(id="commits", cursor_type="row", zebra_stripes=True)
+                            with VerticalScroll(id="detail"):
+                                yield Static("", id="detail_header")
+                                yield Static("", id="detail_meta")
+                                yield Static("Failing CI", classes="section_title", id="ci_fail_title")
+                                yield Static("", id="detail_ci_failures")
+                                yield Static("Body", classes="section_title")
+                                yield Markdown("", id="detail_body")
+                                yield Static("Checks", classes="section_title")
+                                yield Static("", id="detail_checks")
+                                yield Static("Reviewers", classes="section_title")
+                                yield Static("", id="detail_reviewers")
+                                yield Static("Files", classes="section_title")
+                                yield Static("", id="detail_files")
+                    yield PiChatPane(id="pi_panel")
             with TabPane("Clones", id="tab-clones"):
                 yield DataTable(
                     id="clones_table", cursor_type="row", zebra_stripes=True
@@ -514,14 +830,33 @@ class GhstackTUI(App):
         focused = self.focused
         if isinstance(focused, Input):
             return
-        target_id = "commits" if (focused is not None and focused.id == "stacks") else "stacks"
-        self.query_one(f"#{target_id}", DataTable).focus()
+        pi_panel = self.query_one("#pi_panel", PiChatPane)
+        if focused is not None and focused.id == "stacks":
+            self.query_one("#commits", DataTable).focus()
+            return
+        if pi_panel.display and focused is not None and focused.id == "commits":
+            pi_panel.focus_input()
+            return
+        self.query_one("#stacks", DataTable).focus()
 
     def action_focus_left(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Input) and focused.id == "_pi_input":
+            self.query_one("#commits", DataTable).focus()
+            return
         self.query_one("#stacks", DataTable).focus()
 
     def action_focus_right(self) -> None:
+        pi_panel = self.query_one("#pi_panel", PiChatPane)
+        if pi_panel.display:
+            pi_panel.focus_input()
+            return
         self.query_one("#commits", DataTable).focus()
+
+    def action_close_pi(self) -> None:
+        self.query_one("#pi_panel", PiChatPane).close_session()
+        if isinstance(self.focused, Input) and self.focused.id == "_pi_input":
+            self.query_one("#commits", DataTable).focus()
 
     def action_cursor_down(self) -> None:
         focused = self.focused
@@ -561,7 +896,7 @@ class GhstackTUI(App):
             self._clones_worker.cancel()
         status = self.query_one("#status", Static)
         status.update(
-            f"Scanning {self.config.clones_root}/{self.config.clones_prefix}*…"
+            f"Scanning {clones_mod.DEFAULT_ROOT}/{self._config.search.clones_prefix}*…"
         )
         clones_t = self.query_one("#clones_table", DataTable)
         clones_t.clear()
@@ -577,8 +912,8 @@ class GhstackTUI(App):
             worker = get_current_worker()
             try:
                 results = clones_mod.scan(
-                    self.config.clones_root_path,
-                    name_prefix=self.config.clones_prefix,
+                    clones_mod.DEFAULT_ROOT,
+                    name_prefix=self._config.search.clones_prefix,
                 )
             except OSError as exc:
                 if not worker.is_cancelled:
@@ -600,7 +935,7 @@ class GhstackTUI(App):
         n_ghstack = sum(1 for c in results if c.is_ghstack)
         self.query_one("#status", Static).update(
             f"{n_ghstack} ghstack / {n_repos} repos under "
-            f"{self.config.clones_root}/{self.config.clones_prefix}*"
+            f"{clones_mod.DEFAULT_ROOT}/{self._config.search.clones_prefix}*"
         )
 
     def _on_clones_error(self, msg: str) -> None:
@@ -625,39 +960,66 @@ class GhstackTUI(App):
                     return True
         return False
 
-    def action_ask_claude(self) -> None:
+    def _get_selected_commit_context(self) -> tuple[Commit | None, list[str]]:
         commit = self._get_selected_commit()
         if commit is None or commit.pr_num is None:
-            self.notify("No PR selected", severity="warning")
-            return
+            return None, []
         failing: list[str] = []
         if commit.repo_slug and commit.pr_num:
             cached = self._detail_cache.get((commit.repo_slug, commit.pr_num))
             if cached:
                 failing = get_failing_jobs(cached)
+        return commit, failing
+
+    def _default_claude_prompt(self, commit: Commit, failing: list[str]) -> str:
         if failing:
             shown = ", ".join(failing[:3])
             suffix = f" (+{len(failing) - 3} more)" if len(failing) > 3 else ""
-            default_prompt = (
-                f"Fix the CI failures on PR #{commit.pr_num}. "
-                f"Failing jobs: {shown}{suffix}. "
-                f"Use get_failing_jobs to list all failures, "
-                f"get_pr_diff to understand the changes, then fix the issues."
+            return self._config.prompts.claude_fix_ci_template.format(
+                pr_num=commit.pr_num,
+                shown=shown,
+                suffix=suffix,
             )
-        else:
-            default_prompt = (
-                f"Review PR #{commit.pr_num}. "
-                f"Use get_pr_info and get_pr_diff to understand the changes."
-            )
+        return self._config.prompts.claude_review_template.format(pr_num=commit.pr_num)
+
+    def action_ask_claude(self) -> None:
+        commit, failing = self._get_selected_commit_context()
+        if commit is None:
+            self.notify("No PR selected", severity="warning")
+            return
         self.push_screen(
             AskClaudeModal(
                 commit.pr_num,
                 commit.repo_slug,
                 failing,
-                default_prompt,
-                self.config.checkout_path,
+                self._default_claude_prompt(commit, failing),
+                self._config.paths.default_checkout_path,
             ),
             self._on_claude_modal_result,
+        )
+
+    def action_ask_pi(self) -> None:
+        commit, failing = self._get_selected_commit_context()
+        if commit is None:
+            self.notify("No PR selected", severity="warning")
+            return
+        stack = self.stacks[self._current_stack_idx] if self.stacks else None
+        stack_prs = [c.pr_num for c in stack.commits if c.pr_num] if stack else []
+        default_prompt = build_pi_prompt(
+            commit,
+            stack_prs,
+            failing,
+            self._config.prompts.pi_initial_task,
+        )
+        self.push_screen(
+            _AskAgentModal(
+                "Pi",
+                commit.pr_num,
+                commit.repo_slug,
+                failing,
+                default_prompt,
+            ),
+            self._on_pi_modal_result,
         )
 
     def _on_claude_modal_result(
@@ -677,13 +1039,37 @@ class GhstackTUI(App):
         # `claude --mcp-config <configs...>` is variadic: it greedily consumes
         # every following positional as another config path. Put the prompt
         # before --mcp-config so it lands in the [prompt] positional instead.
-        cmd = ["claude"]
+        cmd = shlex.split(self._config.agents.claude_command)
         if prompt:
             cmd.append(prompt)
         if mcp_config_path:
             cmd += ["--mcp-config", mcp_config_path]
         with self.suspend():
             subprocess.run(cmd, cwd=expanded)
+
+    def _on_pi_modal_result(
+        self, result: "tuple[str | None, str | None] | None"
+    ) -> None:
+        if not result:
+            return
+        repo_path, prompt = result
+        if not repo_path:
+            self.notify("No repo path", severity="warning")
+            return
+        expanded = str(Path(repo_path).expanduser())
+        if not Path(expanded).is_dir():
+            self.notify(f"Repo path does not exist: {expanded}", severity="error")
+            return
+        pi_exe = shlex.split(self._config.agents.pi_command)[0]
+        if shutil.which(pi_exe) is None:
+            self.notify(f"{pi_exe} not found in PATH", severity="error")
+            return
+        commit = self._get_selected_commit()
+        title = "Ask Pi"
+        if commit is not None and commit.pr_num is not None:
+            title = f"Ask Pi  PR #{commit.pr_num}  ({commit.repo_slug or '?'})"
+        pi_panel = self.query_one("#pi_panel", PiChatPane)
+        pi_panel.open_session(expanded, title, prompt or "")
 
     def _write_mcp_config(self, repo_path: str, commit: Commit) -> str:
         """Write MCP config under the ghstack-tui root and return its path."""
@@ -706,8 +1092,9 @@ class GhstackTUI(App):
             }
         }
 
-        config_dir = paths.ensure_root()
-        # One config per repo path so different checkouts don't clobber each other.
+        config_dir = Path(self._config.paths.mcp_config_dir).expanduser()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        # Use repo path hash so different repos get distinct configs
         repo_hash = hashlib.sha1(repo_path.encode()).hexdigest()[:8]
         mcp_json = config_dir / f"{repo_hash}.mcp.json"
         mcp_json.write_text(json.dumps(config, indent=2))
@@ -719,7 +1106,11 @@ class GhstackTUI(App):
             self.notify("No PR selected", severity="warning")
             return
         self.push_screen(
-            CheckoutModal(commit.pr_num, commit.repo_slug, self.config.checkout_path),
+            CheckoutModal(
+                commit.pr_num,
+                commit.repo_slug,
+                self._config.paths.default_checkout_path,
+            ),
             self._on_checkout_path,
         )
 

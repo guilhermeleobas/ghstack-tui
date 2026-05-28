@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from ghstack_tui.app import GhstackTUI
-from ghstack_tui.config import Config
+from ghstack_tui.config import get_config
 
 
 def _git_repo_slug(path: Path) -> str | None:
@@ -42,11 +42,11 @@ def _arg_to_query(arg: str, default_query: str) -> str:
 
 
 def main() -> None:
-    cfg = Config.load()
+    cfg = get_config()
     if len(sys.argv) == 1:
         query: str | None = None
     elif len(sys.argv) == 2:
-        query = _arg_to_query(sys.argv[1], cfg.default_query)
+        query = _arg_to_query(sys.argv[1], cfg.search.default_query)
     else:
         query = " ".join(sys.argv[1:])
     GhstackTUI(query).run()

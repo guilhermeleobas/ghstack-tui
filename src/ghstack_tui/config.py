@@ -1,62 +1,169 @@
-"""User-configurable preferences, persisted as JSON.
-
-Loaded once at startup. Environment variables override the on-disk value:
-
-    GHSTACK_TUI_QUERY           default GitHub-search query
-    GHSTACK_TUI_CHECKOUT_PATH   default path to fill into the checkout modal
-    GHSTACK_TUI_CLONES_ROOT     directory scanned by the Clones tab
-    GHSTACK_TUI_CLONES_PREFIX   only directories starting with this prefix are scanned
-"""
-
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import asdict, dataclass
+import tomllib
+from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
-
-from ghstack_tui import paths
-
-DEFAULT_QUERY = "is:pr is:open author:@me"
+from typing import Any
 
 
-@dataclass
-class Config:
-    default_query: str = DEFAULT_QUERY
-    checkout_path: str = "~/git/pytorch313"
+DEFAULT_CONFIG_PATH = Path.home() / ".config" / "ghstack-tui" / "config.toml"
+_CONFIG_ENV_VAR = "GHSTACK_TUI_CONFIG"
+
+
+@dataclass(frozen=True)
+class PathsConfig:
+    default_checkout_path: str = "~/git/pytorch313"
     clones_root: str = "~/git"
+    triage_cache_path: str = "~/.config/ghstack-tui/triage-cache.json"
+    mcp_config_dir: str = "~/.config/ghstack-tui"
+
+
+@dataclass(frozen=True)
+class SearchConfig:
+    default_query: str = "is:pr is:open author:@me"
     clones_prefix: str = "pytorch"
+    gh_search_limit: int = 200
 
-    @classmethod
-    def load(cls) -> "Config":
-        cfg = cls()
-        path = paths.config_path()
-        if path.exists():
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                data = {}
-            for k, v in data.items():
-                if hasattr(cfg, k) and isinstance(v, type(getattr(cfg, k))):
-                    setattr(cfg, k, v)
-        # Env overrides
-        if v := os.environ.get("GHSTACK_TUI_QUERY"):
-            cfg.default_query = v
-        if v := os.environ.get("GHSTACK_TUI_CHECKOUT_PATH"):
-            cfg.checkout_path = v
-        if v := os.environ.get("GHSTACK_TUI_CLONES_ROOT"):
-            cfg.clones_root = v
-        if v := os.environ.get("GHSTACK_TUI_CLONES_PREFIX"):
-            cfg.clones_prefix = v
-        return cfg
 
-    def save(self) -> None:
-        path = paths.config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2))
-        os.replace(tmp, path)
+@dataclass(frozen=True)
+class AgentsConfig:
+    claude_command: str = "claude"
+    pi_command: str = "pi"
 
-    @property
-    def clones_root_path(self) -> Path:
-        return Path(self.clones_root).expanduser()
+
+@dataclass(frozen=True)
+class PromptsConfig:
+    claude_fix_ci_template: str = (
+        "Fix the CI failures on PR #{pr_num}. "
+        "Failing jobs: {shown}{suffix}. "
+        "Use get_failing_jobs to list all failures, "
+        "get_pr_diff to understand the changes, then fix the issues."
+    )
+    claude_review_template: str = (
+        "Review PR #{pr_num}. "
+        "Use get_pr_info and get_pr_diff to understand the changes."
+    )
+    pi_intro: str = "You are helping with a ghstack PR from ghstack-tui."
+    pi_checkout_instruction: str = (
+        "Use the local checkout in the current working directory when possible."
+    )
+    pi_gh_instruction_template: str = (
+        "Use gh for GitHub context when needed, e.g. "
+        "`gh pr view {pr_num} --repo {repo_slug}` and "
+        "`gh pr diff {pr_num} --repo {repo_slug}`."
+    )
+    pi_validation_instruction: str = (
+        "If you make code changes, explain them briefly and run targeted validation commands."
+    )
+    pi_initial_task: str = "Fix the issue or explain the next best step."
+    pi_fallback_task: str = "Review the PR and suggest next steps."
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    paths: PathsConfig = field(default_factory=PathsConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
+    agents: AgentsConfig = field(default_factory=AgentsConfig)
+    prompts: PromptsConfig = field(default_factory=PromptsConfig)
+
+
+def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_dicts(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _config_from_dict(data: dict[str, Any]) -> AppConfig:
+    paths = PathsConfig(**data.get("paths", {}))
+    search = SearchConfig(**data.get("search", {}))
+    agents = AgentsConfig(**data.get("agents", {}))
+    prompts = PromptsConfig(**data.get("prompts", {}))
+    return AppConfig(paths=paths, search=search, agents=agents, prompts=prompts)
+
+
+def _toml_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def render_default_config() -> str:
+    config = AppConfig()
+    return "\n".join(
+        [
+            "# Auto-generated by ghstack-tui on first run.",
+            "# Edit any of these values to customize local defaults.",
+            "",
+            "[paths]",
+            f"default_checkout_path = {_toml_quote(config.paths.default_checkout_path)}",
+            f"clones_root = {_toml_quote(config.paths.clones_root)}",
+            f"triage_cache_path = {_toml_quote(config.paths.triage_cache_path)}",
+            f"mcp_config_dir = {_toml_quote(config.paths.mcp_config_dir)}",
+            "",
+            "[search]",
+            f"default_query = {_toml_quote(config.search.default_query)}",
+            f"clones_prefix = {_toml_quote(config.search.clones_prefix)}",
+            f"gh_search_limit = {config.search.gh_search_limit}",
+            "",
+            "[agents]",
+            f"claude_command = {_toml_quote(config.agents.claude_command)}",
+            f"pi_command = {_toml_quote(config.agents.pi_command)}",
+            "",
+            "[prompts]",
+            f"claude_fix_ci_template = {_toml_quote(config.prompts.claude_fix_ci_template)}",
+            f"claude_review_template = {_toml_quote(config.prompts.claude_review_template)}",
+            f"pi_intro = {_toml_quote(config.prompts.pi_intro)}",
+            f"pi_checkout_instruction = {_toml_quote(config.prompts.pi_checkout_instruction)}",
+            f"pi_gh_instruction_template = {_toml_quote(config.prompts.pi_gh_instruction_template)}",
+            f"pi_validation_instruction = {_toml_quote(config.prompts.pi_validation_instruction)}",
+            f"pi_initial_task = {_toml_quote(config.prompts.pi_initial_task)}",
+            f"pi_fallback_task = {_toml_quote(config.prompts.pi_fallback_task)}",
+            "",
+        ]
+    )
+
+
+def ensure_default_config_file(path: str | Path | None = None) -> Path:
+    config_path = Path(path).expanduser() if path is not None else DEFAULT_CONFIG_PATH
+    if config_path.exists():
+        return config_path
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(render_default_config())
+    return config_path
+
+
+def load_config(path: str | Path | None = None) -> AppConfig:
+    if path is not None:
+        config_path = Path(path).expanduser()
+    else:
+        config_path = _resolve_config_path()
+        if os.environ.get(_CONFIG_ENV_VAR) is None:
+            ensure_default_config_file(config_path)
+    defaults = asdict(AppConfig())
+    if not config_path.is_file():
+        return _config_from_dict(defaults)
+    with config_path.open("rb") as f:
+        raw = tomllib.load(f)
+    merged = _merge_dicts(defaults, raw)
+    return _config_from_dict(merged)
+
+
+def _resolve_config_path() -> Path:
+    override = os.environ.get(_CONFIG_ENV_VAR)
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_CONFIG_PATH
+
+
+@lru_cache(maxsize=1)
+def get_config() -> AppConfig:
+    return load_config()
+
+
+def reset_config_cache() -> None:
+    get_config.cache_clear()
