@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -16,6 +19,22 @@ from ghstack_tui.render import render_diff
 # Ultimate fallback used when the caller doesn't supply a default path.
 # In normal use, the app passes a Config-derived value here.
 _DEFAULT_CHECKOUT_PATH = "~/git/pytorch313"
+
+
+def _render_diff_output(raw: str):
+    if shutil.which("difft"):
+        try:
+            proc = subprocess.run(
+                ["difft", "--color", "always"],
+                input=raw,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return Text.from_ansi(proc.stdout), "difftastic"
+        except OSError:
+            pass
+    return render_diff(raw), "unified"
 
 
 class CheckoutModal(ModalScreen):
@@ -137,10 +156,11 @@ class DiffModal(ModalScreen):
 
     def _on_ready(self, raw: str) -> None:
         lines = raw.count("\n")
+        rendered, mode = _render_diff_output(raw)
         self.query_one("#_dm_status", Label).update(
-            Text(f"{lines} lines   q/esc close", style="dim")
+            Text(f"{lines} lines   {mode}   q/esc close", style="dim")
         )
-        self.query_one("#_dm_text", Static).update(render_diff(raw))
+        self.query_one("#_dm_text", Static).update(rendered)
 
     def _on_error(self, msg: str) -> None:
         self.query_one("#_dm_status", Label).update(

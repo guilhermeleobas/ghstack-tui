@@ -6,10 +6,12 @@ version = "0.1.0"
 
 [tasks]
 tui = "python -m ghstack_tui"
+update = "git pull origin main"
 
 [dependencies]
 python = ">=3.11,<3.13"
 pip = "*"
+difftastic = "*"
 
 [pypi-dependencies]
 textual = ">=5.0"
