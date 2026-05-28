@@ -4,6 +4,9 @@ name = "ghstack-tui"
 platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
+[activation.env]
+GHSTACK_TUI_CONFIG = "$PIXI_PROJECT_ROOT/src/ghstack_tui/config.toml"
+
 [tasks]
 tui = "python -m ghstack_tui"
 update = "git pull origin main"
