@@ -157,14 +157,39 @@ def _summarize_rollup(rollup: list[dict]) -> tuple[int, int, int]:
     return ok, fail, pending
 
 
-def fetch_pr_details(repo_slug: str, pr_num: int) -> dict:
-    """Fetch CI + diff summary for one PR (row enrichment)."""
+
+def fetch_pr_full(repo_slug: str, pr_num: int) -> dict:
+    """Fetch the deep PR record used to populate the detail panel.
+
+    Returned dict keys match the `gh pr view --json` field names.
+    Includes ``comments`` so callers can extract merge-signal and Dr.CI
+    data without additional network calls.
+    """
     proc = _gh([
         "pr", "view", str(pr_num),
         "--repo", repo_slug,
-        "--json", "statusCheckRollup,additions,deletions,changedFiles,reviewDecision",
+        "--json",
+        ",".join([
+            "number", "title", "body", "url", "state", "isDraft",
+            "author", "createdAt", "updatedAt",
+            "baseRefName", "headRefName",
+            "additions", "deletions", "changedFiles", "files",
+            "statusCheckRollup", "reviewDecision", "reviewRequests", "reviews",
+            "mergeable", "mergeStateStatus", "autoMergeRequest", "labels",
+            "comments",
+        ]),
     ])
-    data = json.loads(proc.stdout)
+    return json.loads(proc.stdout)
+
+
+def extract_enrichment(data: dict) -> dict:
+    """Extract row-enrichment fields from a ``fetch_pr_full`` payload.
+
+    Pure function — no network call.  Returns the same shape that
+    ``fetch_pr_details`` used to return so it can be stored in
+    ``_triage_cache`` and applied to :class:`~ghstack_tui.models.Commit`
+    objects identically.
+    """
     ok, fail, pending = _summarize_rollup(data.get("statusCheckRollup") or [])
     return {
         "ci_ok": ok,
@@ -178,25 +203,54 @@ def fetch_pr_details(repo_slug: str, pr_num: int) -> dict:
     }
 
 
-def fetch_pr_full(repo_slug: str, pr_num: int) -> dict:
-    """Fetch the deep PR record used to populate the detail panel.
+def extract_merge_signal(comments: list[dict]) -> dict | None:
+    """Scan a comments list for a merge-bot status signal.
 
-    Returned dict keys match the `gh pr view --json` field names.
+    Pure function — no network call.  Accepts the ``comments`` list from a
+    ``fetch_pr_full`` payload.  Returns ``{"label": str, "style": str,
+    "author": str}`` for the most recent matching bot comment, or None.
     """
-    proc = _gh([
-        "pr", "view", str(pr_num),
-        "--repo", repo_slug,
-        "--json",
-        ",".join([
-            "number", "title", "body", "url", "state", "isDraft",
-            "author", "createdAt", "updatedAt",
-            "baseRefName", "headRefName",
-            "additions", "deletions", "changedFiles", "files",
-            "statusCheckRollup", "reviewDecision", "reviewRequests", "reviews",
-            "mergeable", "mergeStateStatus", "autoMergeRequest", "labels",
-        ]),
-    ])
-    return json.loads(proc.stdout)
+    for c in reversed(comments):
+        author = ((c.get("author") or {}).get("login") or "").lower()
+        body = c.get("body") or ""
+        is_bot = (
+            author in _MERGE_BOT_LOGINS
+            or author.endswith("-bot")
+            or author.endswith("[bot]")
+        )
+        for rx, label, style in _MERGE_SIGNAL_PATTERNS:
+            if rx.search(body) and (is_bot or label == "merge requested"):
+                return {"label": label, "style": style, "author": author}
+    return None
+
+
+def extract_drci_failures(comments: list[dict]) -> dict[str, list[str]]:
+    """Parse the pytorch-bot Dr.CI comment from a comments list.
+
+    Pure function — no network call.  Accepts the ``comments`` list from a
+    ``fetch_pr_full`` payload.  Returns the same ``{job: [capture, ...]}``
+    dict that ``fetch_drci_failures`` used to return.
+    """
+    body: str | None = None
+    for c in comments:
+        author = ((c.get("author") or {}).get("login") or "").lower()
+        if author == "pytorch-bot":
+            body = c.get("body") or ""
+            break
+    if not body or "No Failures" in body:
+        return {}
+    result: dict[str, list[str]] = {}
+    current_job: str | None = None
+    for line in body.splitlines():
+        m = _DRCI_JOB_RE.match(line)
+        if m:
+            current_job = m.group(1)
+            result.setdefault(current_job, [])
+            continue
+        m = _DRCI_CAPTURE_RE.match(line)
+        if m and current_job:
+            result[current_job].append(m.group(1))
+    return result
 
 
 def fetch_pr_diff(repo_slug: str, pr_num: int) -> str:
@@ -235,46 +289,6 @@ _DRCI_JOB_RE = re.compile(
 _DRCI_CAPTURE_RE = re.compile(r"^\s{2,}`(.+)`\s*$")
 
 
-def fetch_drci_failures(repo_slug: str, pr_num: int) -> dict[str, list[str]]:
-    """Parse the pytorch-bot Dr.CI PR comment for failing job → failure captures.
-
-    HUD's failure classifier writes these into the comment as backticked code
-    lines under each ``* [<job>](...)`` bullet — exactly the test invocations
-    shown on hud.pytorch.org. Works for repos where pytorch-bot posts a Dr.CI
-    comment (pytorch/pytorch et al.). Empty dict otherwise.
-    """
-    try:
-        proc = _gh(
-            [
-                "pr", "view", str(pr_num),
-                "--repo", repo_slug,
-                "--json", "comments",
-                "--jq",
-                '.comments[] | select(.author.login=="pytorch-bot") | .body',
-            ],
-            check=False,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return {}
-    if proc.returncode != 0:
-        return {}
-    body = proc.stdout
-    if not body or "No Failures" in body:
-        return {}
-    result: dict[str, list[str]] = {}
-    current_job: str | None = None
-    for line in body.splitlines():
-        m = _DRCI_JOB_RE.match(line)
-        if m:
-            current_job = m.group(1)
-            result.setdefault(current_job, [])
-            continue
-        m = _DRCI_CAPTURE_RE.match(line)
-        if m and current_job:
-            result[current_job].append(m.group(1))
-    return result
-
 
 _MERGE_BOT_LOGINS = {
     "pytorch-merge-bot",
@@ -298,50 +312,6 @@ _MERGE_SIGNAL_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     (re.compile(r"@pytorchbot\s+merge", re.I), "merge requested", "bold cyan"),
 ]
 
-
-def fetch_merge_signal(repo_slug: str, pr_num: int) -> dict | None:
-    """Scan recent PR comments for a merge-bot status signal.
-
-    Returns ``{"label": str, "style": str, "author": str}`` for the most
-    recent matching bot comment, or None if no signal is found. The intent is
-    to surface "merging / merge failed / reverted" states that aren't visible
-    from ``mergeStateStatus`` alone — e.g. pytorch's land workflow runs
-    asynchronously via ``@pytorchbot merge`` comments.
-    """
-    try:
-        proc = _gh(
-            [
-                "pr", "view", str(pr_num),
-                "--repo", repo_slug,
-                "--json", "comments",
-            ],
-            check=False,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None
-    comments = data.get("comments") or []
-    # Walk newest-first; gh returns oldest-first.
-    for c in reversed(comments):
-        author = ((c.get("author") or {}).get("login") or "").lower()
-        body = c.get("body") or ""
-        is_bot = (
-            author in _MERGE_BOT_LOGINS
-            or author.endswith("-bot")
-            or author.endswith("[bot]")
-        )
-        # Also consider user-issued `@pytorchbot merge` requests, which signal
-        # a pending land even before the bot replies.
-        for rx, label, style in _MERGE_SIGNAL_PATTERNS:
-            if rx.search(body) and (is_bot or label == "merge requested"):
-                return {"label": label, "style": style, "author": author}
-    return None
 
 
 # pytest summary line: "FAILED test_foo.py::TestBar::test_baz - AssertionError: ..."

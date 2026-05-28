@@ -36,16 +36,16 @@ from ghstack_tui.detail import get_failing_jobs
 from ghstack_tui.gh_client import (
     DEFAULT_QUERY,
     GhError,
+    extract_drci_failures,
+    extract_enrichment,
+    extract_merge_signal,
     fetch_check_annotations,
-    fetch_drci_failures,
     fetch_failed_tests,
-    fetch_merge_signal,
-    fetch_pr_details,
     fetch_pr_full,
     load_stacks,
 )
 from ghstack_tui.models import Commit, Stack
-from ghstack_tui.modals import AskClaudeModal, CheckoutModal, DiffModal
+from ghstack_tui.modals import AskClaudeModal, CheckoutModal, CheckoutOutputModal, DiffModal
 from ghstack_tui.pi_rpc import PiRpcSession, build_pi_prompt
 
 
@@ -549,18 +549,42 @@ class GhstackTUI(App):
                     return
                 if c.enriched or c.repo_slug is None or c.pr_num is None:
                     continue
+                key = (c.repo_slug, c.pr_num)
+                # If a detail fetch already ran (e.g. user clicked this PR),
+                # extract enrichment from the cached full payload — no network.
+                cached = self._detail_cache.get(key)
+                if cached is not None:
+                    enrichment = extract_enrichment(cached)
+                    for k, v in enrichment.items():
+                        setattr(c, k, v)
+                    c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
+                    if c.updated_at:
+                        self._triage_cache.put(
+                            c.repo_slug, c.pr_num, c.updated_at, enrichment
+                        )
+                    self.call_from_thread(self._update_right_row, idx, row_idx, c)
+                    continue
                 try:
-                    detail = fetch_pr_details(c.repo_slug, c.pr_num)
+                    data = fetch_pr_full(c.repo_slug, c.pr_num)
                 except (GhError, json.JSONDecodeError, OSError) as exc:
                     errors += 1
                     last_err = str(exc)
                     continue
-                for k, v in detail.items():
+                # Populate merge signal and Dr.CI failures from the same payload.
+                signal = extract_merge_signal(data.get("comments") or [])
+                if signal:
+                    data["_merge_signal"] = signal
+                self._drci_failures[key] = extract_drci_failures(
+                    data.get("comments") or []
+                )
+                self._detail_cache[key] = data
+                enrichment = extract_enrichment(data)
+                for k, v in enrichment.items():
                     setattr(c, k, v)
                 c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
                 if c.updated_at:
                     self._triage_cache.put(
-                        c.repo_slug, c.pr_num, c.updated_at, detail
+                        c.repo_slug, c.pr_num, c.updated_at, enrichment
                     )
                 self.call_from_thread(self._update_right_row, idx, row_idx, c)
             if errors and not worker.is_cancelled:
@@ -628,19 +652,34 @@ class GhstackTUI(App):
                     if c.enriched:
                         # Already fresh via cache or per-stack enrichment.
                         continue
-                    try:
-                        detail = fetch_pr_details(c.repo_slug, c.pr_num)
-                    except (GhError, json.JSONDecodeError, OSError):
-                        # Background pass — don't spam notify; per-stack
-                        # enrichment surfaces errors when the user lands on
-                        # the stack.
-                        continue
-                    for k, v in detail.items():
+                    key = (c.repo_slug, c.pr_num)
+                    # Re-use a full payload already fetched by _enrich_stack
+                    # or _fetch_detail — no extra network call needed.
+                    cached = self._detail_cache.get(key)
+                    if cached is not None:
+                        enrichment = extract_enrichment(cached)
+                    else:
+                        try:
+                            data = fetch_pr_full(c.repo_slug, c.pr_num)
+                        except (GhError, json.JSONDecodeError, OSError):
+                            # Background pass — don't spam notify; per-stack
+                            # enrichment surfaces errors when the user lands on
+                            # the stack.
+                            continue
+                        signal = extract_merge_signal(data.get("comments") or [])
+                        if signal:
+                            data["_merge_signal"] = signal
+                        self._drci_failures.setdefault(
+                            key, extract_drci_failures(data.get("comments") or [])
+                        )
+                        self._detail_cache[key] = data
+                        enrichment = extract_enrichment(data)
+                    for k, v in enrichment.items():
                         setattr(c, k, v)
                     c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
                     if c.updated_at:
                         self._triage_cache.put(
-                            c.repo_slug, c.pr_num, c.updated_at, detail
+                            c.repo_slug, c.pr_num, c.updated_at, enrichment
                         )
                     self.call_from_thread(self._on_triage_progress, s_idx, r_idx, c)
         return task
@@ -719,15 +758,16 @@ class GhstackTUI(App):
                 return
             if worker.is_cancelled:
                 return
-            try:
-                signal = fetch_merge_signal(repo_slug, pr_num)
-            except (GhError, OSError):
-                signal = None
+            signal = extract_merge_signal(data.get("comments") or [])
             if signal:
                 data["_merge_signal"] = signal
+            key = (repo_slug, pr_num)
+            self._drci_failures.setdefault(
+                key, extract_drci_failures(data.get("comments") or [])
+            )
+            self._detail_cache[key] = data
             if worker.is_cancelled:
                 return
-            self._detail_cache[(repo_slug, pr_num)] = data
             self.call_from_thread(self._render_detail, data)
         return task
 
@@ -1120,44 +1160,9 @@ class GhstackTUI(App):
         if commit is None or commit.pr_num is None:
             self.notify("No PR selected", severity="warning")
             return
-        self.run_worker(
-            self._run_checkout(commit.pr_num, repo_path),
-            thread=True,
-            name=f"checkout-{commit.pr_num}",
+        self.push_screen(
+            CheckoutOutputModal(commit.pr_num, commit.repo_slug, repo_path)
         )
-
-    def _run_checkout(self, pr_num: int, repo_path: str):
-        def task() -> None:
-            expanded = str(Path(repo_path).expanduser())
-            self.call_from_thread(
-                self.notify, f"Running ghstack checkout {pr_num} in {expanded}…"
-            )
-            try:
-                result = subprocess.run(
-                    ["ghstack", "checkout", str(pr_num)],
-                    cwd=expanded,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-            except FileNotFoundError:
-                self.call_from_thread(
-                    self.notify, "ghstack not found in PATH", severity="error"
-                )
-                return
-            except (OSError, subprocess.SubprocessError) as exc:
-                self.call_from_thread(self.notify, str(exc), severity="error")
-                return
-            if result.returncode == 0:
-                msg = result.stdout.strip() or f"Checked out PR #{pr_num}"
-                self.call_from_thread(self.notify, msg, title="ghstack checkout ✓")
-            else:
-                err = (result.stderr.strip() or result.stdout.strip() or "unknown error")
-                self.call_from_thread(
-                    self.notify, err, title="ghstack checkout ✗", severity="error"
-                )
-
-        return task
 
     def action_open_in_browser(self) -> None:
         commit = self._get_selected_commit()
@@ -1205,14 +1210,16 @@ class GhstackTUI(App):
             worker = get_current_worker()
             key = (repo_slug, pr_num)
             # Try Dr.CI first — pytorch-bot publishes a structured failure
-            # summary with the actual test invocations under each job. One
-            # `gh pr view` call covers the whole PR.
+            # summary with the actual test invocations under each job.
+            # _drci_failures is pre-populated from the fetch_pr_full payload
+            # during enrich/detail, so this guard is usually a no-op.
             if key not in self._drci_failures:
-                try:
-                    self._drci_failures[key] = fetch_drci_failures(
-                        repo_slug, pr_num
+                cached = self._detail_cache.get(key)
+                if cached is not None:
+                    self._drci_failures[key] = extract_drci_failures(
+                        cached.get("comments") or []
                     )
-                except (GhError, OSError):
+                else:
                     self._drci_failures[key] = {}
             if worker.is_cancelled:
                 return
