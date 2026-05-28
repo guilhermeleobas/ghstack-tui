@@ -145,6 +145,113 @@ class CheckoutModal(ModalScreen):
         self.dismiss(None)
 
 
+class CheckoutOutputModal(ModalScreen):
+    """Streams live output of `ghstack checkout` into a scrollable modal."""
+
+    DEFAULT_CSS = """
+    CheckoutOutputModal { align: center middle; }
+    #_cout_box {
+        width: 80;
+        height: 24;
+        border: thick $accent;
+        background: $surface;
+    }
+    #_cout_header {
+        height: 2;
+        padding: 0 1;
+        background: $panel;
+    }
+    #_cout_title  { text-style: bold; }
+    #_cout_status { color: $text-muted; }
+    #_cout_scroll { height: 1fr; }
+    #_cout_text   { padding: 0 1; }
+    #_cout_hint   { height: 1; padding: 0 1; color: $text-muted; }
+    """
+
+    BINDINGS = [Binding("escape", "close", "Close", show=False)]
+
+    def __init__(self, pr_num: int, repo_slug: str | None, repo_path: str) -> None:
+        super().__init__()
+        self._pr_num = pr_num
+        self._repo_slug = repo_slug or "?"
+        self._repo_path = str(Path(repo_path).expanduser())
+        self._done = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="_cout_box"):
+            with Horizontal(id="_cout_header"):
+                yield Label(
+                    f"ghstack checkout  PR #{self._pr_num}  ({self._repo_slug})",
+                    id="_cout_title",
+                )
+                yield Label("Running…", id="_cout_status")
+            with VerticalScroll(id="_cout_scroll"):
+                yield Static("", id="_cout_text")
+            yield Label("esc close", id="_cout_hint")
+
+    def on_mount(self) -> None:
+        self.run_worker(self._run(), thread=True, name="checkout-output")
+
+    def _run(self):
+        def task() -> None:
+            worker = get_current_worker()
+            lines: list[str] = []
+
+            def _flush() -> None:
+                self.app.call_from_thread(
+                    self.query_one("#_cout_text", Static).update,
+                    "\n".join(lines),
+                )
+                self.app.call_from_thread(
+                    self.query_one("#_cout_scroll", VerticalScroll).scroll_end,
+                    animate=False,
+                )
+
+            try:
+                proc = subprocess.Popen(
+                    ["ghstack", "checkout", str(self._pr_num)],
+                    cwd=self._repo_path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except FileNotFoundError:
+                self.app.call_from_thread(self._on_done, 127, ["ghstack not found in PATH"])
+                return
+            except OSError as exc:
+                self.app.call_from_thread(self._on_done, 1, [str(exc)])
+                return
+
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if worker.is_cancelled:
+                    proc.terminate()
+                    return
+                lines.append(line.rstrip())
+                _flush()
+
+            returncode = proc.wait()
+            if not worker.is_cancelled:
+                self.app.call_from_thread(self._on_done, returncode, lines)
+
+        return task
+
+    def _on_done(self, returncode: int, lines: list[str]) -> None:
+        self._done = True
+        self.query_one("#_cout_text", Static).update("\n".join(lines))
+        if returncode == 0:
+            self.query_one("#_cout_status", Label).update(
+                Text("Done ✓", style="green")
+            )
+        else:
+            self.query_one("#_cout_status", Label).update(
+                Text(f"Failed (exit {returncode}) ✗", style="red")
+            )
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class DiffModal(ModalScreen):
     """Full-screen diff overlay. Fetches `gh pr diff` in background, renders colored."""
 
