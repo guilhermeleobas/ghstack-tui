@@ -17,10 +17,7 @@ from textual.worker import get_current_worker
 
 from ghstack_tui.gh_client import GhError, fetch_pr_diff
 from ghstack_tui.render import render_diff
-
-# Ultimate fallback used when the caller doesn't supply a default path.
-# In normal use, the app passes a Config-derived value here.
-_DEFAULT_CHECKOUT_PATH = "~/git/pytorch313"
+from ghstack_tui.config import get_config
 
 
 def _parse_diff_files(raw: str) -> list[tuple[str, str, str]]:
@@ -123,7 +120,7 @@ class CheckoutModal(ModalScreen):
         super().__init__()
         self._pr_num = pr_num
         self._repo_slug = repo_slug or "?"
-        self._default_path = default_path or _DEFAULT_CHECKOUT_PATH
+        self._default_path = default_path or get_config().paths.default_checkout_path
 
     def compose(self) -> ComposeResult:
         with Vertical(id="_co_box"):
@@ -267,7 +264,7 @@ class AskClaudeModal(ModalScreen):
         self._repo_slug = repo_slug or "?"
         self._failing = failing
         self._default_prompt = default_prompt
-        self._default_path = default_path or _DEFAULT_CHECKOUT_PATH
+        self._default_path = default_path or get_config().paths.default_checkout_path
 
     def compose(self) -> ComposeResult:
         with Vertical(id="_cc_box"):

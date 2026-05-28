@@ -37,6 +37,17 @@ def build_pi_prompt(
     if commit.url:
         lines.append(f"- url: {commit.url}")
     lines.append(f"- draft: {'yes' if commit.is_draft else 'no'}")
+    if commit.review_decision:
+        lines.append(f"- review: {commit.review_decision}")
+    if commit.labels:
+        lines.append(f"- labels: {', '.join(commit.labels)}")
+    if commit.additions is not None and commit.deletions is not None:
+        lines.append(f"- size: +{commit.additions}/-{commit.deletions} lines")
+        if commit.changed_files is not None:
+            lines[-1] += f" across {commit.changed_files} files"
+    ci_total = commit.ci_ok + commit.ci_fail + commit.ci_pending
+    if ci_total:
+        lines.append(f"- CI: {commit.ci_ok} ok / {commit.ci_fail} fail / {commit.ci_pending} pending")
 
     if stack_prs:
         lines.extend([

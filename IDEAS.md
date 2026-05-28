@@ -37,3 +37,13 @@ Add pixi / claude as pixi dependency. Or find a way to install them
 ## [x] remove the vim diff view
 
 I don't use it. Just remove it
+
+## [x] When PI is opened, add extra information about which PR the command was triggered
+
+Add the PR number and any other information that might be useful
+
+## [x] the command Ctrl + W to close PI does not work
+
+Fixed by adding `priority=True` to the binding — Input widget was consuming ctrl+w (word-delete) before it bubbled to the app.
+
+## [x] Remove all hardcoded config references on config.py and make everything be read from the config.toml file

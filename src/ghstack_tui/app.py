@@ -402,7 +402,7 @@ class GhstackTUI(App):
         Binding("c", "checkout", "Checkout"),
         Binding("a", "ask_claude", "Ask Claude"),
         Binding("p", "ask_pi", "Ask Pi"),
-        Binding("ctrl+w", "close_pi", "Close Pi"),
+        Binding("ctrl+w", "close_pi", "Close Pi", priority=True),
         Binding("f", "show_failing_tests", "Failing tests"),
         Binding("d", "diff", "Diff"),
         Binding("o", "open_in_browser", "Open PR"),
@@ -1316,7 +1316,6 @@ class GhstackTUI(App):
 
 # --- back-compat re-exports (tests reach in for these names) -----------
 
-_DEFAULT_CHECKOUT_PATH = "~/git/pytorch313"
 _row_for = render_mod.commit_row
 _stack_row = render_mod.stack_row
 _clone_row = render_mod.clone_row
