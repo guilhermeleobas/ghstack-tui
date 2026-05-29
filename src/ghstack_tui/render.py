@@ -90,24 +90,35 @@ def rel_time(iso: str) -> str:
     return f"{s // 86400}d"
 
 
-_MERGE_SIGNAL_TITLE_STYLE: dict[str, str] = {
+_MERGE_SIGNAL_STYLE: dict[str, str] = {
     "merge failed": "bold red",
     "merge requested": "bold cyan",
+    "merging": "bold blue",
     "merged": "bold magenta",
+    "queued": "bold blue",
+    "reverted": "bold red",
 }
+
+
+def status_pretty(c: Commit) -> Text:
+    if not c.merge_signal:
+        return Text("")
+    style = _MERGE_SIGNAL_STYLE.get(c.merge_signal, "dim")
+    return Text(c.merge_signal, style=style)
 
 
 def commit_row(c: Commit) -> tuple:
     pr = Text(f"#{c.pr_num}" if c.pr_num is not None else "—")
     if c.is_draft:
         pr.stylize("yellow")
-    title_style = _MERGE_SIGNAL_TITLE_STYLE.get(c.merge_signal, "bold white" if c.merge_signal else "")
+    title_style = _MERGE_SIGNAL_STYLE.get(c.merge_signal, "bold white" if c.merge_signal else "")
     title = Text(truncate(c.subject, 50), style=title_style) if title_style else truncate(c.subject, 50)
     return (
         pr,
         title,
         labels_pretty(c.labels),
         ci_pretty(c),
+        status_pretty(c),
         str(c.comments_count) if c.comments_count else "",
         diff_pretty(c),
         rel_time(c.updated_at),

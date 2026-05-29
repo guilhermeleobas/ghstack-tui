@@ -184,7 +184,7 @@ def test_row_for_basic():
         repo_slug="pytorch/pytorch",
     )
     row = _row_for(c)
-    assert len(row) == 7   # PR, Title, Labels, CI, 💬, ±, Upd
+    assert len(row) == 8   # PR, Title, Labels, CI, Status, 💬, ±, Upd
     # PR cell
     assert "#101" in row[0].plain
     # Title must contain literal [dynamo] — NOT parsed as markup

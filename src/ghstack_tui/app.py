@@ -411,7 +411,7 @@ class GhstackTUI(App):
         Binding("escape", "blur_query", "Leave query", show=False),
     ]
 
-    _RIGHT_COLS = ("PR", "Title", "Labels", "CI", "💬", "±", "Upd")
+    _RIGHT_COLS = ("PR", "Title", "Labels", "CI", "Status", "💬", "±", "Upd")
     _STACK_COLS = ("Top PR", "#", "Title")
     _CLONES_COLS = ("Path", "Branch", "Repo", "PR", "Subject", "✎")
 
@@ -628,6 +628,9 @@ class GhstackTUI(App):
                     continue
                 for k, v in cached.items():
                     setattr(c, k, v)
+                # Old cache entries lack merge_signal — force re-enrichment once.
+                if "merge_signal" not in cached:
+                    c.enriched = False
                 c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
         # Repaint commits table and stacks table.
         stacks_t = self.query_one("#stacks", DataTable)
