@@ -477,7 +477,9 @@ class GhstackTUI(App):
         stacks_t.add_columns(*self._STACK_COLS)
 
         commits_t: DataTable = self.query_one("#commits", DataTable)
-        commits_t.add_columns(*self._RIGHT_COLS)
+        for col in self._RIGHT_COLS:
+            width = 18 if col == "Status" else None
+            commits_t.add_column(col, width=width)
 
         clones_t: DataTable = self.query_one("#clones_table", DataTable)
         clones_t.add_columns(*self._CLONES_COLS)
