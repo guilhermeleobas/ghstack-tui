@@ -810,6 +810,7 @@ class GhstackTUI(App):
         pr_num = data.get("number")
         commit = self._get_selected_commit()
         repo_slug = commit.repo_slug if commit and commit.pr_num == pr_num else None
+        self._propagate_merge_signal(repo_slug, pr_num, data)
         drci = (
             self._drci_failures.get((repo_slug, pr_num), {})
             if repo_slug is not None and pr_num is not None
@@ -835,6 +836,26 @@ class GhstackTUI(App):
         else:
             ci_fail_title.display = False
             ci_failures.display = False
+
+    def _propagate_merge_signal(self, repo_slug: str | None, pr_num: int | None, data: dict) -> None:
+        """Update c.merge_signal from a freshly-fetched detail payload and repaint rows."""
+        if repo_slug is None or pr_num is None:
+            return
+        signal = data.get("_merge_signal")
+        new_signal = (signal.get("label") or "") if signal else ""
+        for s_idx, stack in enumerate(self.stacks):
+            for r_idx, c in enumerate(stack.commits):
+                if c.repo_slug == repo_slug and c.pr_num == pr_num:
+                    if c.merge_signal == new_signal:
+                        return
+                    c.merge_signal = new_signal
+                    if s_idx == self._current_stack_idx:
+                        commits_t = self.query_one("#commits", DataTable)
+                        if r_idx < commits_t.row_count:
+                            for col_idx, val in enumerate(render_mod.commit_row(c)):
+                                commits_t.update_cell_at((r_idx, col_idx), val, update_width=False)
+                    self._repaint_stack_row(s_idx)
+                    return
 
     def _render_detail_error(self, msg: str) -> None:
         self.query_one("#detail_meta", Static).update(
