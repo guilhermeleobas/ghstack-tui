@@ -28,6 +28,9 @@ class Commit:
     review_decision: str = ""
     enriched: bool = False
 
+    # filled alongside enrichment from bot comments in the full PR payload
+    merge_signal: str = ""       # one of: "merge requested", "merge failed", "merged", ""
+
     # filled from triage rules once enrichment lands
     verdict: str = "ok"          # one of: attention, ready, waiting, draft, ok
     verdict_reason: str = ""

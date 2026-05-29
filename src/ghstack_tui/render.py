@@ -90,11 +90,19 @@ def rel_time(iso: str) -> str:
     return f"{s // 86400}d"
 
 
+_MERGE_SIGNAL_TITLE_STYLE: dict[str, str] = {
+    "merge failed": "bold red",
+    "merge requested": "bold cyan",
+    "merged": "bold magenta",
+}
+
+
 def commit_row(c: Commit) -> tuple:
     pr = Text(f"#{c.pr_num}" if c.pr_num is not None else "—")
     if c.is_draft:
         pr.stylize("yellow")
-    title = truncate(c.subject, 50)
+    title_style = _MERGE_SIGNAL_TITLE_STYLE.get(c.merge_signal, "bold white" if c.merge_signal else "")
+    title = Text(truncate(c.subject, 50), style=title_style) if title_style else truncate(c.subject, 50)
     return (
         pr,
         title,
