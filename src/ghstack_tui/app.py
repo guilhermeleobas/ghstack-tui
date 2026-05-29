@@ -603,6 +603,14 @@ class GhstackTUI(App):
             return
         for col_idx, val in enumerate(render_mod.commit_row(c)):
             commits_t.update_cell_at((row_idx, col_idx), val, update_width=False)
+        self._repaint_stack_row(stack_idx)
+
+    def _repaint_stack_row(self, stack_idx: int) -> None:
+        stacks_t = self.query_one("#stacks", DataTable)
+        if stack_idx >= stacks_t.row_count or stack_idx >= len(self.stacks):
+            return
+        for col_idx, val in enumerate(render_mod.stack_row(self.stacks[stack_idx])):
+            stacks_t.update_cell_at((stack_idx, col_idx), val, update_width=False)
 
     # --- triage (needs-attention badges across all stacks) ---------------
 
@@ -621,7 +629,13 @@ class GhstackTUI(App):
                 for k, v in cached.items():
                     setattr(c, k, v)
                 c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
-        # Repaint commits table for the currently-shown stack.
+        # Repaint commits table and stacks table.
+        stacks_t = self.query_one("#stacks", DataTable)
+        for s_idx, s in enumerate(self.stacks):
+            if s_idx >= stacks_t.row_count:
+                break
+            for col_idx, val in enumerate(render_mod.stack_row(s)):
+                stacks_t.update_cell_at((s_idx, col_idx), val, update_width=False)
         if 0 <= self._current_stack_idx < len(self.stacks):
             self._repaint_current_commits()
 
@@ -685,6 +699,7 @@ class GhstackTUI(App):
         return task
 
     def _on_triage_progress(self, s_idx: int, r_idx: int, c: Commit) -> None:
+        self._repaint_stack_row(s_idx)
         # Update the commits table only when this stack is the visible one.
         if s_idx != self._current_stack_idx:
             return

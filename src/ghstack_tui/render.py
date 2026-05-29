@@ -115,10 +115,22 @@ def commit_row(c: Commit) -> tuple:
 
 
 def stack_row(s: Stack) -> tuple:
+    signals = {c.merge_signal for c in s.commits if c.merge_signal}
+    if "merge failed" in signals:
+        title_style = "bold red"
+    elif signals & {"merge requested", "merging"}:
+        title_style = "bold cyan"
+    elif "merged" in signals:
+        title_style = "bold magenta"
+    else:
+        title_style = ""
+    title: str | Text = truncate(s.title, 80)
+    if title_style:
+        title = Text(str(title), style=title_style)
     return (
         f"#{s.top_pr}" if s.top_pr is not None else "—",
         str(len(s.commits)),
-        truncate(s.title, 80),
+        title,
     )
 
 
