@@ -181,10 +181,32 @@ def render_header(data: dict) -> Text:
     """Top line of the detail panel: PR number, title, state, draft, author, merge state."""
     state = (data.get("state") or "").upper()
     is_draft = data.get("isDraft", False)
+    mergeable = (data.get("mergeable") or "").upper()
+    signal = data.get("_merge_signal")
+    signal_label = (signal.get("label") or "") if signal else ""
+
+    if signal_label == "merge failed":
+        title_style = "bold red"
+    elif signal_label == "merge requested":
+        title_style = "bold cyan"
+    elif signal_label == "merged":
+        title_style = "bold magenta"
+    elif data.get("autoMergeRequest") or data.get("isInMergeQueue"):
+        title_style = "bold blue"
+    elif mergeable == "CONFLICTING":
+        title_style = "bold red"
+    elif state == "MERGED":
+        title_style = "bold magenta"
+    elif state == "CLOSED":
+        title_style = "dim red"
+    elif is_draft:
+        title_style = "bold yellow"
+    else:
+        title_style = "bold white"
 
     t = Text()
     t.append(f"#{data.get('number','?')} ", style="bold")
-    t.append(data.get("title") or "", style="bold white")
+    t.append(data.get("title") or "", style=title_style)
     t.append("  ")
 
     if is_draft:
@@ -208,7 +230,6 @@ def render_header(data: dict) -> Text:
     if base and head:
         t.append(f"{head} → {base}", style="dim")
 
-    mergeable = (data.get("mergeable") or "").upper()
     if mergeable == "CONFLICTING":
         t.append("  conflicts", style="bold red")
     elif state == "OPEN":
@@ -224,7 +245,6 @@ def render_header(data: dict) -> Text:
             elif mergeable == "UNKNOWN":
                 t.append("  unknown", style="dim")
 
-    signal = data.get("_merge_signal")
     if signal and signal.get("label"):
         t.append(f"  {signal['label']}", style=signal.get("style") or "bold cyan")
 
