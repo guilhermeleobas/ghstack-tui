@@ -191,6 +191,7 @@ def extract_enrichment(data: dict) -> dict:
     objects identically.
     """
     ok, fail, pending = _summarize_rollup(data.get("statusCheckRollup") or [])
+    signal = data.get("_merge_signal")
     return {
         "ci_ok": ok,
         "ci_fail": fail,
@@ -199,6 +200,7 @@ def extract_enrichment(data: dict) -> dict:
         "deletions": data.get("deletions"),
         "changed_files": data.get("changedFiles"),
         "review_decision": data.get("reviewDecision") or "",
+        "merge_signal": (signal.get("label") or "") if signal else "",
         "enriched": True,
     }
 

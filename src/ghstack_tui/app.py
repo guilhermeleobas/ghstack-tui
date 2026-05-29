@@ -557,9 +557,6 @@ class GhstackTUI(App):
                     enrichment = extract_enrichment(cached)
                     for k, v in enrichment.items():
                         setattr(c, k, v)
-                    cached_signal = cached.get("_merge_signal")
-                    if cached_signal:
-                        c.merge_signal = cached_signal.get("label") or ""
                     c.verdict, c.verdict_reason = triage_mod.verdict_for(c)
                     if c.updated_at:
                         self._triage_cache.put(
@@ -577,7 +574,6 @@ class GhstackTUI(App):
                 signal = extract_merge_signal(data.get("comments") or [])
                 if signal:
                     data["_merge_signal"] = signal
-                    c.merge_signal = signal.get("label") or ""
                 self._drci_failures[key] = extract_drci_failures(
                     data.get("comments") or []
                 )
@@ -662,9 +658,6 @@ class GhstackTUI(App):
                     cached = self._detail_cache.get(key)
                     if cached is not None:
                         enrichment = extract_enrichment(cached)
-                        cached_signal = cached.get("_merge_signal")
-                        if cached_signal:
-                            c.merge_signal = cached_signal.get("label") or ""
                     else:
                         try:
                             data = fetch_pr_full(c.repo_slug, c.pr_num)
@@ -676,7 +669,6 @@ class GhstackTUI(App):
                         signal = extract_merge_signal(data.get("comments") or [])
                         if signal:
                             data["_merge_signal"] = signal
-                            c.merge_signal = signal.get("label") or ""
                         self._drci_failures.setdefault(
                             key, extract_drci_failures(data.get("comments") or [])
                         )
