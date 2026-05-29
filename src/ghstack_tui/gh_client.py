@@ -292,6 +292,7 @@ _DRCI_CAPTURE_RE = re.compile(r"^\s{2,}`(.+)`\s*$")
 
 _MERGE_BOT_LOGINS = {
     "pytorch-merge-bot",
+    "pytorchmergebot",
     "pytorch-bot",
     "github-actions",
     "mergify",
