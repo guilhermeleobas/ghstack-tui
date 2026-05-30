@@ -31,19 +31,12 @@ class SearchConfig:
 @dataclass(frozen=True)
 class AgentsConfig:
     claude_command: str
-    pi_command: str
 
 
 @dataclass(frozen=True)
 class PromptsConfig:
     claude_fix_ci_template: str
     claude_review_template: str
-    pi_intro: str
-    pi_checkout_instruction: str
-    pi_gh_instruction_template: str
-    pi_validation_instruction: str
-    pi_initial_task: str
-    pi_fallback_task: str
 
 
 @dataclass(frozen=True)
