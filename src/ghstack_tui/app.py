@@ -100,6 +100,7 @@ class GhstackTUI(App):
         Binding("/", "focus_query", "Edit query"),
         Binding("t", "toggle_tab", "Tab", priority=True),
         Binding("escape", "blur_query", "Leave query", show=False),
+        Binding("C", "pytorch_fix_remote", "PyTorch fix remote"),
     ]
 
     _RIGHT_COLS = ("PR", "Title", "Labels", "CI", "Status", "💬", "±", "Upd")
@@ -859,6 +860,16 @@ class GhstackTUI(App):
             return
         webbrowser.open(commit.url)
         self.notify(f"Opened {commit.url}", title="Browser")
+
+    def action_pytorch_fix_remote(self) -> None:
+        commit = self._get_selected_commit()
+        if commit is None or commit.url is None:
+            self.notify("No PR URL available", severity="warning")
+            return
+        subprocess.Popen(
+            ["bash", "-c", f"source ~/git/dotfiles/scripts.sh && pytorch-fix-remote {shlex.quote(commit.url)}"],
+        )
+        self.notify(f"pytorch-fix-remote {commit.url}", title="PyTorch fix remote")
 
     def action_show_failing_tests(self) -> None:
         commit = self._get_selected_commit()
